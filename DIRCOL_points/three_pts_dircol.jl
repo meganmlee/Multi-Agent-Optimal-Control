@@ -130,10 +130,11 @@ function point_equality_constraint(params::NamedTuple, Z::Vector)::Vector
     N, idx, xic, xg = params.N, params.idx, params.xic, params.xg 
     
     # Return all equality constraints (dynamics + initial condition)
-    c = zeros(eltype(Z), idx.nc + idx.nx)
+    c = zeros(eltype(Z), idx.nc + 2*idx.nx)
     
     c[1:idx.nc] = point_dynamics_constraints(params, Z)
     c[idx.nc+1:idx.nc+idx.nx] = Z[idx.x[1]] - xic
+    c[idx.nc+idx.nx+1:idx.nc+2*idx.nx] = Z[idx.x[N]] - xg
     
     return c
 end
@@ -143,7 +144,7 @@ function inequality_constraint(params::NamedTuple, Z::Vector)::Vector
     
     # Create inequality constraints for minimum distance between points
     # and terminal goal constraint
-    c = zeros(eltype(Z), 3*N + 1)
+    c = zeros(eltype(Z), 3*N)
 
     c_idx = 1
     for i = 1:N
@@ -165,9 +166,9 @@ function inequality_constraint(params::NamedTuple, Z::Vector)::Vector
     end
 
     # Check goal state constraint
-    # c < 0 ensures final state is within goal_tol of target
-    xN = Z[idx.x[N]]
-    c[c_idx] = norm(xg - xN)^2 - params.goal_tol^2
+    # # c < 0 ensures final state is within goal_tol of target
+    # xN = Z[idx.x[N]]
+    # c[c_idx] = norm(xg - xN)^2 - params.goal_tol^2
     
     return c 
 end
@@ -255,10 +256,10 @@ function point_trajectory_optimization(;verbose=true)
     x_u = Inf*ones(idx.nz)
 
     # Inequality constraint bounds
-    c_l = zeros(N*3 + 1)
-    c_u = Inf*ones(N*3 + 1)
-    c_l[N*3 + 1] = -Inf
-    c_u[N*3 + 1] = 0
+    c_l = zeros(N*3)
+    c_u = Inf*ones(N*3)
+    # c_l[N*3 + 1] = -Inf
+    # c_u[N*3 + 1] = 0
 
     # Initial guess - linear interpolation between initial and goal states
     init_traj = range(xic, xg, length = N)
