@@ -13,7 +13,7 @@ using Colors
 using Rotations
 using CoordinateTransformations
 
-include("simple_altro.jl")
+include("min_time_altro.jl")
 
 # --- Robot Definition ---
 
@@ -48,7 +48,7 @@ const DDQ_LIMITS = (-5.0, 5.0)
 const JERK_LIMITS = (-10.0, 10.0)
 
 # Collision
-const COLLISION_THRESHOLD = 1.0 # DCOL proximity value threshold
+# const COLLISION_THRESHOLD = 1.0 # DCOL proximity value threshold
 
 # --- PoE Helper Functions ---
 
