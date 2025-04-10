@@ -13,7 +13,7 @@ function stage_cost(p::NamedTuple,x,u,k)
     dx = x - p.Xref[k]
     du = u[2:end] - p.Uref[k][2:end]
     h = u[1]
-    return 0.5*dx'*p.Q*dx + 0.5*du'*p.R*du + h
+    return 0.5*dx'*p.Q*dx + 0.5*du'*p.R[2:end, 2:end]*du + h
 end
 function term_cost(p::NamedTuple,x)
     dx = x - p.Xref[p.N]
@@ -22,14 +22,12 @@ end
 function stage_cost_expansion(p::NamedTuple,x,u,k)
     dx = x - p.Xref[k]
     du = u[2:end] - p.Uref[k][2:end]
-    R_time = zeros(1,1)
-    r_time = [p.time_weight]
-
-    # Construct the full R matrix with time and actual controls
-    R_full = BlockDiagonal([R_time, p.R_actual])
-    r_full = [r_time; p.R_actual*du]
-
-    return p.Q, p.Q*dx, R_full, r_full
+    
+    # For time component: quadratic term = 0, linear term = 1
+    Juu = Diagonal([1e-6; diag(p.R)[2:end]])
+    Ju = [1.0; p.R[2:end, 2:end] * du]
+    
+    return p.Q, p.Q*dx, Juu, Ju
 end
 function term_cost_expansion(p::NamedTuple,x)
     dx = x - p.Xref[p.N]

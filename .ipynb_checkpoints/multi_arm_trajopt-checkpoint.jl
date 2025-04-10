@@ -69,13 +69,6 @@ function exp_twist(twist::AbstractVector{T}, theta_val::Number) where T
     theta = T(theta_val) # Ensure correct type
     v = SVector{3,T}(twist[1:3])
     w = SVector{3,T}(twist[4:6])
-
-    # Add robustness check
-    if !isfinite(theta) || !all(isfinite.(v)) || !all(isfinite.(w))
-        @warn "Non-finite input to exp_twist: theta=$theta"
-        return AffineMap(RotMatrix{3,T}(I), SVector{3,T}(zeros(T, 3)))
-    end
-
     w_norm = norm(w)
 
     # Declare R explicitly as RotMatrix3{T}
@@ -417,7 +410,7 @@ function ineq_con_u(p::NamedTuple, u::AbstractVector)
     h_constraints = [h - p.h_max; -h + p.h_min]
     
     # Constraints for jerk controls
-    jerk_constraints = vcat(u_jerk .- p.u_max_jerk, p.u_min_jerk .- u_jerk)
+    jerk_constraints = vcat(u_jerk .- p.u_max, p.u_min .- u_jerk)
     return vcat(h_constraints, jerk_constraints)
 end
 
@@ -470,8 +463,7 @@ end
 
 "Discrete-time dynamics using RK4 integration."
 function discrete_dynamics(p::NamedTuple, x::AbstractVector, u::AbstractVector, k)
-    # h = u[1]
-    h = clamp(u[1], p.h_min, p.h_max)
+    h = u[1]
     k1 = dynamics(p, x, u[2:end], k) * h
     k2 = dynamics(p, x + k1 / 2, u[2:end], k) * h
     k3 = dynamics(p, x + k2 / 2, u[2:end], k) * h
@@ -595,7 +587,7 @@ function main()
         x0 = vcat(q_start1, zeros(NJ*2), q_start2, zeros(NJ*2))
         xg = vcat(q_goal1, zeros(NJ*2), q_goal2, zeros(NJ*2))
         Xref = [deepcopy(xg) for i = 1:N]
-        Uref = [[3.0; zeros(NU)] for i = 1:N-1]
+        Uref = [[3.0; zeros(nu_jerk)] for i = 1:N-1]
 
         # --- Cost Matrices (Updated dimensions) ---
         Q = Diagonal(zeros(T, NX))
@@ -606,7 +598,7 @@ function main()
 
         # --- Constraint Limits (Updated structure) ---
         u_min_jerk = fill(T(JERK_LIMITS[1]), NU); u_max_jerk = fill(T(JERK_LIMITS[2]), NU)
-        h_min = 0.3; h_max = 5.0
+        h_min = 0.1; h_max = 3.0
         # Assuming same limits for all joints, structure as vector of tuples
         q_lim_single = (fill(T(Q_LIMITS[1]), NJ), fill(T(Q_LIMITS[2]), NJ))
         dq_lim_single = (fill(T(DQ_LIMITS[1]), NJ), fill(T(DQ_LIMITS[2]), NJ))
@@ -618,7 +610,7 @@ function main()
         # --- Calculate Constraint Dimensions ---
         temp_params_for_eval = (; robot_kin=[robot_kin1, robot_kin2], q_lim=q_lim_all, dq_lim=dq_lim_all, ddq_lim=ddq_lim_all, 
         P_links, collision_threshold = T(COLLISION_THRESHOLD), 
-        nu=NU+1, u_min_jerk, u_max_jerk, h_min, h_max, self_collision_pairs)
+        nu=NU, u_min, u_max, self_collision_pairs)
         ncx = length(ineq_con_x(temp_params_for_eval, x0))
         ncu = length(ineq_con_u(temp_params_for_eval, Uref[1]))
         println("Calculated ncx = $ncx, ncu = $ncu")
@@ -626,7 +618,7 @@ function main()
 
         # --- Parameters Bundle ---
         params = (
-            nx = NX, nu = NU+1, ncx = ncx, ncu = ncu, N = N,
+            nx = NX, nu = NU, ncx = ncx, ncu = ncu, N = N,
             Q = Q, R = R, Qf = Qf,
             u_min_jerk = u_min_jerk, u_max_jerk = u_max_jerk,
             h_min = h_min, h_max = h_max,
@@ -645,7 +637,7 @@ function main()
         # --- iLQR Variables ---
         Xn = deepcopy(X); Un = deepcopy(U)
         P = [zeros(T, NX, NX) for i = 1:N]; p = [zeros(T, NX) for i = 1:N]
-        d = [zeros(T, NU+1) for i = 1:N-1]; K = [zeros(T, NU+1, NX) for i = 1:N-1]
+        d = [zeros(T, NU) for i = 1:N-1]; K = [zeros(T, NU, NX) for i = 1:N-1]
 
         # --- Run iLQR ---
         println("Starting iLQR Optimization (3D Robot)...")
@@ -683,11 +675,8 @@ function main()
              dc.update_pose!(vis[Symbol("Base$r")], base_prim)
         end
 
-        # Calculate total duration based on optimized time scaling
-        fps = 30  # Desired animation frame rate
-
         # Animate using DCOL helper
-        anim = mc.Animation(vis, fps)
+        anim = mc.Animation(floor(Int, 1 / dt))
         println("Creating Animation...")
         for k = 1:N
             mc.atframe(anim, k) do
