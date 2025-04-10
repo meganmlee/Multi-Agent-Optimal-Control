@@ -20,41 +20,5 @@ if __name__ == "__main__":
     controller = SingleArmPIDControl(model, data)
     controller.go_to_home(model, data)
 
-    # # Set specific arm positions
-    # arm1_angles = [0, np.pi/4, 0, np.pi/2, 0, 0, 0]  # 7 joint angles
-    # controller.set_arm_target(1, arm1_angles)
-
-    # # Control grippers
-    # controller.close_gripper(1)  # close first gripper
-    # controller.close_gripper(2)
-    # controller.go_to_desired(model, data)
-
-    ############################################################
- 
-    # object_pos = np.array([
-    #         [0.3, 0.3, 1.6, 0.0, 0.0, 0.0],
-    #         [-0.3, -0.3, 1.6, 0.0, 0.0, 0.0]
-    #     ])
-    # controller = ImpedanceControl(model, data, object_pos)
-    # controller.go_to_desired(model, data)
-
-    '''
-    Workflow:
-
-    Take in desired goal point in world frame for robot 1 and robot 2
-    us ImpedanceControl to reach grasp points
-    close gripper on grasp points 
-
-    ***Now the two robots can be treated as one system with 14 DoF
-    take in desired height
-    IK
-    lift object using DualArmControl class
-    Take in desired orientation of object
-    do some massaging to get it in cartesian 
-    IK
-    use DualArmControl class for mid air manpulation
-
-    '''
-
     # Launch the simulate viewer
     viewer.launch(model, data)
