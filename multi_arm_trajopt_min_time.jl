@@ -13,7 +13,7 @@ using Colors
 using Rotations
 using CoordinateTransformations
 
-include("simple_altro.jl")
+include("min_time_altro.jl")
 
 # --- Robot Definition ---
 
@@ -69,6 +69,13 @@ function exp_twist(twist::AbstractVector{T}, theta_val::Number) where T
     theta = T(theta_val) # Ensure correct type
     v = SVector{3,T}(twist[1:3])
     w = SVector{3,T}(twist[4:6])
+
+    # Add robustness check
+    if !isfinite(theta) || !all(isfinite.(v)) || !all(isfinite.(w))
+        @warn "Non-finite input to exp_twist: theta=$theta"
+        return AffineMap(RotMatrix{3,T}(I), SVector{3,T}(zeros(T, 3)))
+    end
+
     w_norm = norm(w)
 
     # Declare R explicitly as RotMatrix3{T}
@@ -403,13 +410,37 @@ end
 "Inequality constraints on control u (jerk limits)."
 function ineq_con_u(p::NamedTuple, u::AbstractVector)
     # u - u_max <= 0; -u + u_min <= 0
-    return vcat(u .- p.u_max, p.u_min .- u)
+    h = u[1]
+    u_jerk = u[2:end]
+    
+    # Constraints for time scaling factor (must be positive)
+    h_constraints = [h - p.h_max; -h + p.h_min]
+    
+    # Constraints for jerk controls
+    jerk_constraints = vcat(u_jerk .- p.u_max_jerk, p.u_min_jerk .- u_jerk)
+    return vcat(h_constraints, jerk_constraints)
 end
 
 "Jacobian of inequality constraints w.r.t. control u."
 function ineq_con_u_jac(p::NamedTuple, u::AbstractVector)
-    # Simple structure for box constraints
-    return Array(float([I(p.nu); -I(p.nu)]))
+    nu = p.nu
+    nu_jerk = nu - 1
+    
+    # Create the Jacobian matrix
+    # 2 rows for h constraints + 2*nu_jerk rows for jerk constraints
+    J_u = zeros(2 + 2*nu_jerk, nu)
+    
+    # Derivatives for h constraints
+    J_u[1, 1] = 1.0  # ∂(h - h_max)/∂h = 1
+    J_u[2, 1] = -1.0 # ∂(-h + h_min)/∂h = -1
+    
+    # Derivatives for jerk constraints
+    for i = 1:nu_jerk
+        J_u[2 + i, 1 + i] = 1.0  # ∂(u_jerk_i - u_max_i)/∂u_jerk_i = 1
+        J_u[2 + nu_jerk + i, 1 + i] = -1.0  # ∂(-u_jerk_i + u_min_i)/∂u_jerk_i = -1
+    end
+    
+    return J_u
 end
 
 
@@ -439,10 +470,12 @@ end
 
 "Discrete-time dynamics using RK4 integration."
 function discrete_dynamics(p::NamedTuple, x::AbstractVector, u::AbstractVector, k)
-    k1 = p.dt * dynamics(p, x, u, k)
-    k2 = p.dt * dynamics(p, x + k1 / 2, u, k)
-    k3 = p.dt * dynamics(p, x + k2 / 2, u, k)
-    k4 = p.dt * dynamics(p, x + k3, u, k)
+    # h = u[1]
+    h = clamp(u[1], p.h_min, p.h_max)
+    k1 = dynamics(p, x, u[2:end], k) * h
+    k2 = dynamics(p, x + k1 / 2, u[2:end], k) * h
+    k3 = dynamics(p, x + k2 / 2, u[2:end], k) * h
+    k4 = dynamics(p, x + k3, u[2:end], k) * h
     return x + (1 / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
 end
 
@@ -561,17 +594,19 @@ function main()
 
         x0 = vcat(q_start1, zeros(NJ*2), q_start2, zeros(NJ*2))
         xg = vcat(q_goal1, zeros(NJ*2), q_goal2, zeros(NJ*2))
-        Xref = [deepcopy(xg) for i = 1:N]; Uref = [zeros(NU) for i = 1:N-1]
+        Xref = [deepcopy(xg) for i = 1:N]
+        Uref = [[3.0; zeros(NU)] for i = 1:N-1]
 
         # --- Cost Matrices (Updated dimensions) ---
         Q = Diagonal(zeros(T, NX))
         Qf_q_weight = 100.0; Qf_dq_weight = 10.0; Qf_ddq_weight = 1.0
         Qf_diag_single = vcat(fill(Qf_q_weight, NJ), fill(Qf_dq_weight, NJ), fill(Qf_ddq_weight, NJ))
         Qf = Diagonal(vcat(Qf_diag_single, Qf_diag_single))
-        R_jerk_weight = 0.01; R = R_jerk_weight * Diagonal(ones(T, NU))
+        R_jerk_weight = 0.01; R = R_jerk_weight * Diagonal(ones(T, NU+1)) # add one for time 
 
         # --- Constraint Limits (Updated structure) ---
-        u_min = fill(T(JERK_LIMITS[1]), NU); u_max = fill(T(JERK_LIMITS[2]), NU)
+        u_min_jerk = fill(T(JERK_LIMITS[1]), NU); u_max_jerk = fill(T(JERK_LIMITS[2]), NU)
+        h_min = 0.3; h_max = 5.0
         # Assuming same limits for all joints, structure as vector of tuples
         q_lim_single = (fill(T(Q_LIMITS[1]), NJ), fill(T(Q_LIMITS[2]), NJ))
         dq_lim_single = (fill(T(DQ_LIMITS[1]), NJ), fill(T(DQ_LIMITS[2]), NJ))
@@ -583,7 +618,7 @@ function main()
         # --- Calculate Constraint Dimensions ---
         temp_params_for_eval = (; robot_kin=[robot_kin1, robot_kin2], q_lim=q_lim_all, dq_lim=dq_lim_all, ddq_lim=ddq_lim_all, 
         P_links, collision_threshold = T(COLLISION_THRESHOLD), 
-        nu=NU, u_min, u_max, self_collision_pairs)
+        nu=NU+1, u_min_jerk, u_max_jerk, h_min, h_max, self_collision_pairs)
         ncx = length(ineq_con_x(temp_params_for_eval, x0))
         ncu = length(ineq_con_u(temp_params_for_eval, Uref[1]))
         println("Calculated ncx = $ncx, ncu = $ncu")
@@ -591,9 +626,10 @@ function main()
 
         # --- Parameters Bundle ---
         params = (
-            nx = NX, nu = NU, ncx = ncx, ncu = ncu, N = N,
+            nx = NX, nu = NU+1, ncx = ncx, ncu = ncu, N = N,
             Q = Q, R = R, Qf = Qf,
-            u_min = u_min, u_max = u_max,
+            u_min_jerk = u_min_jerk, u_max_jerk = u_max_jerk,
+            h_min = h_min, h_max = h_max,
             q_lim = q_lim_all, dq_lim = dq_lim_all, ddq_lim = ddq_lim_all, # Pass the structured limits
             Xref = Xref, Uref = Uref, dt = dt,
             P_links = P_links,
@@ -604,12 +640,12 @@ function main()
 
         # --- Initial Trajectory Guess ---
         X = [deepcopy(x0) + ((i-1)/(N-1))*(xg - x0) for i = 1:N]
-        U = [zeros(T, NU) for i = 1:N-1]
+        U = [[1.0; zeros(T, NU)] for i = 1:N-1]
 
         # --- iLQR Variables ---
         Xn = deepcopy(X); Un = deepcopy(U)
         P = [zeros(T, NX, NX) for i = 1:N]; p = [zeros(T, NX) for i = 1:N]
-        d = [zeros(T, NU) for i = 1:N-1]; K = [zeros(T, NU, NX) for i = 1:N-1]
+        d = [zeros(T, NU+1) for i = 1:N-1]; K = [zeros(T, NU+1, NX) for i = 1:N-1]
 
         # --- Run iLQR ---
         println("Starting iLQR Optimization (3D Robot)...")
@@ -647,8 +683,11 @@ function main()
              dc.update_pose!(vis[Symbol("Base$r")], base_prim)
         end
 
+        # Calculate total duration based on optimized time scaling
+        fps = 30  # Desired animation frame rate
+
         # Animate using DCOL helper
-        anim = mc.Animation(floor(Int, 1 / dt))
+        anim = mc.Animation(floor(Int, fps))
         println("Creating Animation...")
         for k = 1:N
             mc.atframe(anim, k) do
