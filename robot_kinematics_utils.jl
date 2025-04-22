@@ -274,12 +274,12 @@ function ineq_con_x(p::NamedTuple, x::AbstractVector)
     end
 
     # 2. Inter-Robot Collision Avoidance
-    # for i = 1:N_LINKS
-    #     for j = 1:N_LINKS
-    #         prox, _ = dc.proximity(p.P_links[1][i], p.P_links[2][j])
-    #         push!(constraints, p.collision_threshold - prox)
-    #     end
-    # end
+    for i = 1:N_LINKS
+        for j = 1:N_LINKS
+            prox, _ = dc.proximity(p.P_links[1][i], p.P_links[2][j])
+            push!(constraints, p.collision_threshold - prox)
+        end
+    end
 
     # 3. Self-Collision Avoidance 
     # for r = 1:NUM_ROBOTS
@@ -339,28 +339,28 @@ function ineq_con_x_jac(p::NamedTuple, x::AbstractVector)
     end
 
     # --- 2. Jacobians for Inter-Robot Collisions ---
-    # q1_indices = 1:NJ
-    # q2_indices = NX_PER_ROBOT .+ (1:NJ)
-    # pose1_slice = 1:6; pose2_slice = 7:12
+    q1_indices = 1:NJ
+    q2_indices = NX_PER_ROBOT .+ (1:NJ)
+    pose1_slice = 1:6; pose2_slice = 7:12
 
-    # for i = 1:N_LINKS
-    #     for j = 1:N_LINKS
-    #         current_row += 1
-    #         if current_row > ncx; @warn "Jacobian row overflow (inter)!"; break; end
-    #         P1 = p.P_links[1][i]; P2 = p.P_links[2][j]
-    #         prox_val, J_prox_combined = dc.proximity_gradient(P1, P2)
-    #         J_prox_P1 = J_prox_combined[pose1_slice]
-    #         J_prox_P2 = J_prox_combined[pose2_slice]
+    for i = 1:N_LINKS
+        for j = 1:N_LINKS
+            current_row += 1
+            if current_row > ncx; @warn "Jacobian row overflow (inter)!"; break; end
+            P1 = p.P_links[1][i]; P2 = p.P_links[2][j]
+            prox_val, J_prox_combined = dc.proximity_gradient(P1, P2)
+            J_prox_P1 = J_prox_combined[pose1_slice]
+            J_prox_P2 = J_prox_combined[pose2_slice]
 
-    #         # Use new analytical FK Jacobian
-    #         J_fk1 = calculate_link_pose_jacobian_geom(q1, i, p.robot_kin[1]) # Use geom version
-    #         J_fk2 = calculate_link_pose_jacobian_geom(q2, j, p.robot_kin[2]) # Use geom version
+            # Use new analytical FK Jacobian
+            J_fk1 = calculate_link_pose_jacobian_geom(q1, i, p.robot_kin[1]) # Use geom version
+            J_fk2 = calculate_link_pose_jacobian_geom(q2, j, p.robot_kin[2]) # Use geom version
 
-    #         J_x[current_row, q1_indices] = -J_prox_P1' * J_fk1
-    #         J_x[current_row, q2_indices] = -J_prox_P2' * J_fk2
-    #     end
-    #      if current_row > ncx; break; end
-    # end
+            J_x[current_row, q1_indices] = -J_prox_P1' * J_fk1
+            J_x[current_row, q2_indices] = -J_prox_P2' * J_fk2
+        end
+         if current_row > ncx; break; end
+    end
 
 #     # --- 3. Jacobians for Self-Collisions --- (Skipping detail, requires pairs and careful indexing)
 #     for r = 1:NUM_ROBOTS
