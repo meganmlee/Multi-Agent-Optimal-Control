@@ -1,22 +1,16 @@
-using Pkg
-Pkg.add(["LinearAlgebra", "StaticArrays", "ForwardDiff", "Printf", "SparseArrays", "MeshCat", "Random", "Colors", "Rotations", "CoordinateTransformations"])
+# robot_kinematics_utils.jl
 
-import DifferentiableCollisions as dc
 using LinearAlgebra
 using StaticArrays
-import ForwardDiff as FD
-using Printf
-using SparseArrays
-import MeshCat as mc
-import Random
-using Colors
 using Rotations
 using CoordinateTransformations
-
-include("simple_altro.jl")
+import DifferentiableCollisions as dc # Needed for constraints
+using SparseArrays                   # Needed for sparse Jacobians
 
 # --- Robot Definition ---
-
+# Re-define necessary constants within this file or ensure they are passed/globally available
+# It's generally better practice to pass them or define them where used,
+# but for simplicity with the existing structure, we define them here.
 # Choose Number of Joints (6 or 7)
 const NUM_JOINTS_PER_ROBOT = 6 # <--- CHANGE HERE FOR 6 or 7 DOF
 const NJ = NUM_JOINTS_PER_ROBOT
@@ -69,6 +63,13 @@ function exp_twist(twist::AbstractVector{T}, theta_val::Number) where T
     theta = T(theta_val) # Ensure correct type
     v = SVector{3,T}(twist[1:3])
     w = SVector{3,T}(twist[4:6])
+    
+    # Add robustness check
+    if !isfinite(theta) || !all(isfinite.(v)) || !all(isfinite.(w))
+        @warn "Non-finite input to exp_twist: theta=$theta"
+        return AffineMap(RotMatrix{3,T}(I), SVector{3,T}(zeros(T, 3)))
+    end
+
     w_norm = norm(w)
 
     # Declare R explicitly as RotMatrix3{T}
@@ -273,12 +274,12 @@ function ineq_con_x(p::NamedTuple, x::AbstractVector)
     end
 
     # 2. Inter-Robot Collision Avoidance
-    for i = 1:N_LINKS
-        for j = 1:N_LINKS
-            prox, _ = dc.proximity(p.P_links[1][i], p.P_links[2][j])
-            push!(constraints, p.collision_threshold - prox)
-        end
-    end
+    # for i = 1:N_LINKS
+    #     for j = 1:N_LINKS
+    #         prox, _ = dc.proximity(p.P_links[1][i], p.P_links[2][j])
+    #         push!(constraints, p.collision_threshold - prox)
+    #     end
+    # end
 
     # 3. Self-Collision Avoidance 
     # for r = 1:NUM_ROBOTS
@@ -338,28 +339,28 @@ function ineq_con_x_jac(p::NamedTuple, x::AbstractVector)
     end
 
     # --- 2. Jacobians for Inter-Robot Collisions ---
-    q1_indices = 1:NJ
-    q2_indices = NX_PER_ROBOT .+ (1:NJ)
-    pose1_slice = 1:6; pose2_slice = 7:12
+    # q1_indices = 1:NJ
+    # q2_indices = NX_PER_ROBOT .+ (1:NJ)
+    # pose1_slice = 1:6; pose2_slice = 7:12
 
-    for i = 1:N_LINKS
-        for j = 1:N_LINKS
-            current_row += 1
-            if current_row > ncx; @warn "Jacobian row overflow (inter)!"; break; end
-            P1 = p.P_links[1][i]; P2 = p.P_links[2][j]
-            prox_val, J_prox_combined = dc.proximity_gradient(P1, P2)
-            J_prox_P1 = J_prox_combined[pose1_slice]
-            J_prox_P2 = J_prox_combined[pose2_slice]
+    # for i = 1:N_LINKS
+    #     for j = 1:N_LINKS
+    #         current_row += 1
+    #         if current_row > ncx; @warn "Jacobian row overflow (inter)!"; break; end
+    #         P1 = p.P_links[1][i]; P2 = p.P_links[2][j]
+    #         prox_val, J_prox_combined = dc.proximity_gradient(P1, P2)
+    #         J_prox_P1 = J_prox_combined[pose1_slice]
+    #         J_prox_P2 = J_prox_combined[pose2_slice]
 
-            # Use new analytical FK Jacobian
-            J_fk1 = calculate_link_pose_jacobian_geom(q1, i, p.robot_kin[1]) # Use geom version
-            J_fk2 = calculate_link_pose_jacobian_geom(q2, j, p.robot_kin[2]) # Use geom version
+    #         # Use new analytical FK Jacobian
+    #         J_fk1 = calculate_link_pose_jacobian_geom(q1, i, p.robot_kin[1]) # Use geom version
+    #         J_fk2 = calculate_link_pose_jacobian_geom(q2, j, p.robot_kin[2]) # Use geom version
 
-            J_x[current_row, q1_indices] = -J_prox_P1' * J_fk1
-            J_x[current_row, q2_indices] = -J_prox_P2' * J_fk2
-        end
-         if current_row > ncx; break; end
-    end
+    #         J_x[current_row, q1_indices] = -J_prox_P1' * J_fk1
+    #         J_x[current_row, q2_indices] = -J_prox_P2' * J_fk2
+    #     end
+    #      if current_row > ncx; break; end
+    # end
 
 #     # --- 3. Jacobians for Self-Collisions --- (Skipping detail, requires pairs and careful indexing)
 #     for r = 1:NUM_ROBOTS
@@ -402,14 +403,48 @@ end
 
 "Inequality constraints on control u (jerk limits)."
 function ineq_con_u(p::NamedTuple, u::AbstractVector)
-    # u - u_max <= 0; -u + u_min <= 0
-    return vcat(u .- p.u_max, p.u_min .- u)
+    if p.min_time
+        # u - u_max <= 0; -u + u_min <= 0
+        h = u[1]
+        u_jerk = u[2:end]
+        
+        # Constraints for time scaling factor (must be positive)
+        h_constraints = [h - p.h_max; -h + p.h_min]
+        
+        # Constraints for jerk controls
+        jerk_constraints = vcat(u_jerk .- p.u_max_jerk, p.u_min_jerk .- u_jerk)
+        return vcat(h_constraints, jerk_constraints)
+    else
+        # u - u_max <= 0; -u + u_min <= 0
+        return vcat(u .- p.u_max, p.u_min .- u)
+    end
 end
 
 "Jacobian of inequality constraints w.r.t. control u."
 function ineq_con_u_jac(p::NamedTuple, u::AbstractVector)
-    # Simple structure for box constraints
-    return Array(float([I(p.nu); -I(p.nu)]))
+    if p.min_time
+        nu = p.nu
+        nu_jerk = nu - 1
+        
+        # Create the Jacobian matrix
+        # 2 rows for h constraints + 2*nu_jerk rows for jerk constraints
+        J_u = zeros(2 + 2*nu_jerk, nu)
+        
+        # Derivatives for h constraints
+        J_u[1, 1] = 1.0  # ∂(h - h_max)/∂h = 1
+        J_u[2, 1] = -1.0 # ∂(-h + h_min)/∂h = -1
+        
+        # Derivatives for jerk constraints
+        for i = 1:nu_jerk
+            J_u[2 + i, 1 + i] = 1.0  # ∂(u_jerk_i - u_max_i)/∂u_jerk_i = 1
+            J_u[2 + nu_jerk + i, 1 + i] = -1.0  # ∂(-u_jerk_i + u_min_i)/∂u_jerk_i = -1
+        end
+        
+        return J_u
+    else
+        # Simple structure for box constraints
+        return Array(float([I(p.nu); -I(p.nu)]))
+    end
 end
 
 
@@ -439,249 +474,19 @@ end
 
 "Discrete-time dynamics using RK4 integration."
 function discrete_dynamics(p::NamedTuple, x::AbstractVector, u::AbstractVector, k)
-    k1 = p.dt * dynamics(p, x, u, k)
-    k2 = p.dt * dynamics(p, x + k1 / 2, u, k)
-    k3 = p.dt * dynamics(p, x + k2 / 2, u, k)
-    k4 = p.dt * dynamics(p, x + k3, u, k)
-    return x + (1 / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    if p.min_time
+        # h = u[1]
+        h = clamp(u[1], p.h_min, p.h_max)
+        k1 = dynamics(p, x, u[2:end], k) * h
+        k2 = dynamics(p, x + k1 / 2, u[2:end], k) * h
+        k3 = dynamics(p, x + k2 / 2, u[2:end], k) * h
+        k4 = dynamics(p, x + k3, u[2:end], k) * h
+        return x + (1 / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    else
+        k1 = p.dt * dynamics(p, x, u, k)
+        k2 = p.dt * dynamics(p, x + k1 / 2, u, k)
+        k3 = p.dt * dynamics(p, x + k2 / 2, u, k)
+        k4 = p.dt * dynamics(p, x + k3, u, k)
+        return x + (1 / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    end
 end
-
-# --- Main Function Update ---
-function main()
-    let
-        # --- Define Robot Kinematics (Example: Generic 6-DOF) ---
-        T = Float64
-        # Twists ξᵢ (Defined in base frame {0} at q=0)
-        w1 = SA[T(0), T(0), T(1)]; p1 = SA[T(0), T(0), T(0)]
-        w2 = SA[T(0), T(1), T(0)]; p2 = SA[T(0), T(0), T(0.33)]
-        w3 = SA[T(0), T(1), T(0)]; p3 = SA[T(0), T(0), T(0.33+0.26)]
-        w4 = SA[T(1), T(0), T(0)]; p4 = SA[T(0.1), T(0), T(0.33+0.26+0.015)]
-        w5 = SA[T(0), T(-1), T(0)]; p5 = SA[T(0.1+0.19), T(0), T(0.33+0.26+0.015)]
-        w6 = SA[T(1), T(0), T(0)]; p6 = SA[T(0.1+0.19+0.072), T(0), T(0.33+0.26+0.015)]
-        twists_base = [
-            vcat(-cross(w1, p1), w1), vcat(-cross(w2, p2), w2), vcat(-cross(w3, p3), w3),
-            vcat(-cross(w4, p4), w4), vcat(-cross(w5, p5), w5), vcat(-cross(w6, p6), w6)
-        ]
-        if NUM_JOINTS_PER_ROBOT == 7; # Add 7th DOF if needed
-                w7 = SA[T(0), T(1), T(0)]; p7 = p6 # Example 7th joint at same location as 6
-                push!(twists_base, vcat(-cross(w7, p7), w7))
-        end
-
-        # M_frames_zero: Pose of frame {i} relative to base {0} at q=0
-        # Frame {i} is attached to link i (output of joint i), often placed at origin of joint i+1
-        # M_frames_zero[1] is pose of frame {0} relative to {0} -> Identity
-        # M_frames_zero[i+1] is pose of frame {i} relative to {0} at q=0
-        # This requires knowing the exact geometry/DH params/URDF at q=0
-        # Let's construct it based on the points p used above (p_i = origin of joint i+1 relative to base 0)
-        M_frames_zero = Vector{AffineMap{RotMatrix3{T}, SVector{3, T}}}(undef, NJ + 1)
-        M_frames_zero[1] = AffineMap(RotMatrix{3,T}(I), SA[T(0),T(0),T(0)]) # Frame {0} rel {0}
-        # Need points p0..pNJ (p0=p1, p1=p2, ..., p_{NJ}=EndEffector)
-        points_p = [p1, p2, p3, p4, p5, p6] # Points defining joint i+1 origin relative to base
-        if NUM_JOINTS_PER_ROBOT == 7; push!(points_p, p7); end # Add point for frame 7 origin
-        # Assume frame {i} is located at origin of joint {i+1} (point points_p[i]) with same orientation as base at q=0
-        # we set the orientation so that the capsule's x-axis is aligned with the z-axis of the joint frame {i}
-        M_frames_zero[2] = AffineMap(RotMatrix{3,T}(I), points_p[1]) # Frame {1} rel {0}
-        M_frames_zero[3] = AffineMap(RotMatrix{3,T}(I), points_p[2]) # Frame {2} rel {0}
-        M_frames_zero[4] = AffineMap(RotMatrix(RotY(π/2)), points_p[3]) # Frame {3} rel {0}
-        M_frames_zero[5] = AffineMap(RotMatrix(RotY(π/2)), points_p[4]) # Frame {4} rel {0}
-        M_frames_zero[6] = AffineMap(RotMatrix(RotY(π/2)), points_p[5]) # Frame {5} rel {0}
-        M_frames_zero[7] = AffineMap(RotMatrix(RotY(π/2)), points_p[6]) # Frame {6} rel {0}
-        if NUM_JOINTS_PER_ROBOT == 7; M_frames_zero[8] = AffineMap(RotMatrix(RotY(π/2)), p7); end # Frame {7} rel {0}
-
-        # hard code the link length values for collision capsule
-        link_lengths_geom = [0.33, 0.26, 0.1, 0.19, 0.072, 0.11] # Example lengths (L1, L2, L3, L4, L5, L6)
-        # define the transmoation from frame{i} to the center of the collision capsule
-        T_link_centers = Vector{AffineMap{RotMatrix3{T}, SVector{3, T}}}(undef, NJ)
-        for i = 1:NJ
-            # Offset from frame {i} (at joint i+1) back to center of link i
-            # Needs link vector direction in frame {i}. Assume frame {i} x-axis points back along link
-            L_i = link_lengths_geom[i]
-            T_link_centers[i] = AffineMap(RotMatrix(RotY(π/2)), SA[T(0.0), T(0.0), T(L_i/2.0)])
-            # !! This assumes orientation of frame {i} aligns with link i - needs verification !!
-        end
-
-
-        # Radii for collision geometry
-        vis_link_radii = [0.095, 0.095, 0.06, 0.06, 0.05, 0.04] # Example radii
-        if NUM_JOINTS_PER_ROBOT == 7; push!(vis_link_radii, 0.005); end
-
-        # Base transforms
-        T_base1 = AffineMap(RotMatrix(RotZ(0.0)), SA[T(0.0), T(0.0), T(0)]) # red
-        T_base2 = AffineMap(RotMatrix(RotZ(π)), SA[T(0.88101), T(-0.01304), T(0)]) # blue
-
-        # Create Kinematics structs
-        robot_kin1 = RobotKinematics(twists_base, T_base1, M_frames_zero, T_link_centers, vis_link_radii)
-        robot_kin2 = RobotKinematics(twists_base, T_base2, M_frames_zero, T_link_centers, vis_link_radii)
-
-        # define self-collision pairs to check
-        self_collision_pairs_to_check = [
-            (1, 3), (1, 4), (1, 5), (1, 6),
-            (2, 5), (2, 6),
-            (3, 5), (3, 6),
-            (4, 6)
-        ]
-        # Filter pairs based on actual NJ
-        self_collision_pairs = filter(p -> p[1] <= NJ && p[2] <= NJ, self_collision_pairs_to_check)
-        println("Checking self-collision pairs: ", self_collision_pairs)
-
-        # --- Create Collision Primitives ---
-        P_links = [[], []]
-        primitive_shape = ["capsule", "capsule", "capsule", "cylinder", "capsule", "cylinder"]
-        for r = 1:NUM_ROBOTS
-            current_robot_kin = (r == 1) ? robot_kin1 : robot_kin2
-            for i = 1:N_LINKS # N_LINKS = NJ
-                len = link_lengths_geom[i] # Use calculated geometric length
-                rad = T(current_robot_kin.link_radius[i])
-                if primitive_shape[i] == "capsule"
-                    # Capsule: radius and length
-                    link_prim = dc.CapsuleMRP(rad, len)
-                elseif primitive_shape[i] == "cylinder"
-                    # Cylinder: radius and length
-                    link_prim = dc.CylinderMRP(rad, len)
-                else
-                    error("Unknown primitive shape: $primitive_shape[i]")
-                end
-                link_prim.r_offset = SA[T(0), T(0), T(0)] # Offsets handled by T_link_centers now
-                link_prim.Q_offset = SMatrix{3,3,T,9}(I)
-                push!(P_links[r], link_prim)
-            end
-        end
-
-
-        # --- Simulation Parameters ---
-        N = 51 # Fewer steps initially for faster debugging
-        dt = 0.1
-
-        # --- Start and Goal States (Adjust for 6/7 DOF) ---
-        q_start1 = [0.0, 0, 0.0, 0.0, -π/2, 0.0]  # Robot 1 start configuration
-        q_goal1 = [0.0, π/5, -π/5, 0, -π/4, 0.0]  # Robot 1 goal configuration
-
-        q_start2 = [0.0, 0, 0.0,  0.0, -π/2, 0.0]  # Robot 2 start configuration
-        q_goal2 = [0.0, π/5, π/5,  0, π/2, 0.0]  # Robot 2 goal configuration
-
-        x0 = vcat(q_start1, zeros(NJ*2), q_start2, zeros(NJ*2))
-        xg = vcat(q_goal1, zeros(NJ*2), q_goal2, zeros(NJ*2))
-        Xref = [deepcopy(xg) for i = 1:N]; Uref = [zeros(NU) for i = 1:N-1]
-
-        # --- Cost Matrices (Updated dimensions) ---
-        Q = Diagonal(zeros(T, NX))
-        Qf_q_weight = 100.0; Qf_dq_weight = 10.0; Qf_ddq_weight = 1.0
-        Qf_diag_single = vcat(fill(Qf_q_weight, NJ), fill(Qf_dq_weight, NJ), fill(Qf_ddq_weight, NJ))
-        Qf = Diagonal(vcat(Qf_diag_single, Qf_diag_single))
-        R_jerk_weight = 0.01; R = R_jerk_weight * Diagonal(ones(T, NU))
-
-        # --- Constraint Limits (Updated structure) ---
-        u_min = fill(T(JERK_LIMITS[1]), NU); u_max = fill(T(JERK_LIMITS[2]), NU)
-        # Assuming same limits for all joints, structure as vector of tuples
-        q_lim_single = (fill(T(Q_LIMITS[1]), NJ), fill(T(Q_LIMITS[2]), NJ))
-        dq_lim_single = (fill(T(DQ_LIMITS[1]), NJ), fill(T(DQ_LIMITS[2]), NJ))
-        ddq_lim_single = (fill(T(DDQ_LIMITS[1]), NJ), fill(T(DDQ_LIMITS[2]), NJ))
-        q_lim_all = [q_lim_single, q_lim_single] # For robot 1 and 2
-        dq_lim_all = [dq_lim_single, dq_lim_single]
-        ddq_lim_all = [ddq_lim_single, ddq_lim_single]
-
-        # --- Calculate Constraint Dimensions ---
-        temp_params_for_eval = (; robot_kin=[robot_kin1, robot_kin2], q_lim=q_lim_all, dq_lim=dq_lim_all, ddq_lim=ddq_lim_all, 
-        P_links, collision_threshold = T(COLLISION_THRESHOLD), 
-        nu=NU, u_min, u_max, self_collision_pairs)
-        ncx = length(ineq_con_x(temp_params_for_eval, x0))
-        ncu = length(ineq_con_u(temp_params_for_eval, Uref[1]))
-        println("Calculated ncx = $ncx, ncu = $ncu")
-        if ncx == 0; @warn("ncx is zero, check ineq_con_x implementation!"); end
-
-        # --- Parameters Bundle ---
-        params = (
-            min_time=true, nx = NX, nu = NU, ncx = ncx, ncu = ncu, N = N,
-            Q = Q, R = R, Qf = Qf,
-            u_min = u_min, u_max = u_max,
-            q_lim = q_lim_all, dq_lim = dq_lim_all, ddq_lim = ddq_lim_all, # Pass the structured limits
-            Xref = Xref, Uref = Uref, dt = dt,
-            P_links = P_links,
-            robot_kin = [robot_kin1, robot_kin2], # Pass kinematics parameters
-            collision_threshold = T(COLLISION_THRESHOLD),
-            self_collision_pairs = self_collision_pairs # Pass self-collision pairs
-        );
-
-        # --- Initial Trajectory Guess ---
-        X = [deepcopy(x0) + ((i-1)/(N-1))*(xg - x0) for i = 1:N]
-        U = [zeros(T, NU) for i = 1:N-1]
-
-        # --- iLQR Variables ---
-        Xn = deepcopy(X); Un = deepcopy(U)
-        P = [zeros(T, NX, NX) for i = 1:N]; p = [zeros(T, NX) for i = 1:N]
-        d = [zeros(T, NU) for i = 1:N-1]; K = [zeros(T, NU, NX) for i = 1:N-1]
-
-        # --- Run iLQR ---
-        println("Starting iLQR Optimization (3D Robot)...")
-        Xhist = iLQR(params, X, U, P, p, K, d, Xn, Un;
-                    atol=1e-1, max_iters=3000, verbose=true, ρ=1.0, ϕ=10.0) # Adjust params for potentially harder problem
-
-        println("iLQR Finished.")
-        X_sol = Xhist[end]
-
-        # --- Visualization ---
-        println("Setting up Visualization...")
-        vis = mc.Visualizer()
-        mc.open(vis)
-        mc.setprop!(vis["/Background"], "top_color", mc.RGBA(1.0, 1.0, 1.0, 1.0))
-        mc.setprop!(vis["/Background"], "bottom_color", mc.RGBA(1.0, 1.0, 1.0, 1.0))
-        mc.delete!(vis["/Grid"]); mc.delete!(vis["/Axes"])
-
-        colors = [mc.RGBA(1.0, 0.0, 0.0, 0.8), mc.RGBA(0.0, 0.0, 1.0, 0.8)]
-        link_vis_names = [[Symbol("R$(r)_L$(l)") for l=1:N_LINKS] for r=1:NUM_ROBOTS]
-
-        # Build visual primitives using DCOL helper
-        println("Building visual primitives...")
-        for r = 1:NUM_ROBOTS
-            for l = 1:N_LINKS
-                primitive_obj = params.P_links[r][l]
-                vis_name = link_vis_names[r][l]
-                vis_color = colors[r]
-                # print the primitive
-                dc.build_primitive!(vis, primitive_obj, vis_name; color = vis_color)
-            end
-             # Optionally add base visualization
-             dc.build_primitive!(vis, dc.SphereMRP(0.01), Symbol("Base$r"); color=colors[r]) # Small sphere at base
-             base_prim = dc.SphereMRP(0.01)
-             base_prim.r = params.robot_kin[r].T_base.translation
-             dc.update_pose!(vis[Symbol("Base$r")], base_prim)
-        end
-
-        # Animate using DCOL helper
-        anim = mc.Animation(floor(Int, 1 / dt))
-        println("Creating Animation...")
-        for k = 1:N
-            mc.atframe(anim, k) do
-                x_k = X_sol[k]
-                q1_k = x_k[1:NJ]
-                q2_k = x_k[NX_PER_ROBOT .+ (1:NJ)]
-                all_q_k = [q1_k, q2_k]
-
-                for r = 1:NUM_ROBOTS
-                    # Calculate FK for current robot
-                    poses_world_k, _, _, _ = forward_kinematics_poe(all_q_k[r], params.robot_kin[r])
-
-                    for l = 1:N_LINKS
-                        primitive_obj = params.P_links[r][l]
-                        T_link_center = poses_world_k[l]
-                        pos = T_link_center.translation
-                        rot = RotMatrix(T_link_center.linear)
-
-                        # Update DCOL primitive state
-                        primitive_obj.r = pos
-                        primitive_obj.p = Rotations.params(Rotations.MRP(rot))
-
-                        # Update Meshcat visualization
-                        vis_name = link_vis_names[r][l]
-                        dc.update_pose!(vis[vis_name], primitive_obj)
-                    end
-                end
-            end
-        end
-        println("Setting Animation...")
-        mc.setanimation!(vis, anim)
-        println("Done. Check MeshCat visualizer.")
-    end # End let
-end # End main
-
-main()

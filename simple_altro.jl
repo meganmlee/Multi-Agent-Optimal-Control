@@ -6,22 +6,40 @@
 
 # using LinearAlgebra
 # using Printf
-# import ForwardDiff as FD
+import ForwardDiff as FD
 
 # -------------------THIS IS ALL ALTRO-------------------------------
 function stage_cost(p::NamedTuple,x,u,k)
-    dx = x - p.Xref[k]
-    du = u - p.Uref[k]
-    return 0.5*dx'*p.Q*dx + 0.5*du'*p.R*du
+    if p.min_time
+        dx = x - p.Xref[k]
+        du = u[2:end] - p.Uref[k][2:end]
+        h = u[1]
+        return 0.5*dx'*p.Q*dx + 0.5*du'*p.R[2:end, 2:end]*du + h
+    else
+        dx = x - p.Xref[k]
+        du = u - p.Uref[k]
+        return 0.5*dx'*p.Q*dx + 0.5*du'*p.R*du
+    end
 end
 function term_cost(p::NamedTuple,x)
     dx = x - p.Xref[p.N]
     return 0.5*dx'*p.Qf*dx
 end
 function stage_cost_expansion(p::NamedTuple,x,u,k)
-    dx = x - p.Xref[k]
-    du = u - p.Uref[k]
-    return p.Q, p.Q*dx, p.R, p.R*du
+    if p.min_time
+        dx = x - p.Xref[k]
+        du = u[2:end] - p.Uref[k][2:end]
+        
+        # For time component: quadratic term = 0, linear term = 1
+        Juu = Diagonal([1e-6; diag(p.R)[2:end]])
+        Ju = [1.0; p.R[2:end, 2:end] * du]
+        
+        return p.Q, p.Q*dx, Juu, Ju
+    else
+        dx = x - p.Xref[k]
+        du = u - p.Uref[k]
+        return p.Q, p.Q*dx, p.R, p.R*du
+    end
 end
 function term_cost_expansion(p::NamedTuple,x)
     dx = x - p.Xref[p.N]
@@ -137,6 +155,41 @@ function trajectory_AL_cost(params,X,U,μ,μx,ρ,λ)
     J += dot(λ,hxv) + 0.5*ρ*hxv'*hxv
     return J
 end
+function trajectory_length(params,X,U)
+    N = params.N
+    L = 0.0
+    for k = 1:N-1
+        L += norm(X[k+1][1:6] - X[k][1:6])
+        L += norm(X[k+1][19:24] - X[k][19:24])
+    end
+    return L
+end
+function trajectory_jerk_avg(params,U)
+    N = params.N
+    J = 0.0
+    for k = 1:N-1
+        if params.min_time
+            J += norm(U[k][2:end])
+        else
+            J += norm(U[k])
+        end
+    end
+    J /= (N-1)
+    return J
+end
+function trajectory_time(params,U)
+    N = params.N
+    T = 0.0
+    for k = 1:N-1
+        if params.min_time
+            T += U[k][1]
+        else
+            T += params.dt
+        end
+    end
+    return T
+end
+
 function forward_pass!(params,X,U,K,d,ΔJ,Xn,Un,μ,μx,ρ,λ; max_linesearch_iters = 20)
 
     N = params.N
