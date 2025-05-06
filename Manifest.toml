@@ -2,7 +2,7 @@
 
 julia_version = "1.11.4"
 manifest_format = "2.0"
-project_hash = "964fea81e188a212e090c41c6b4f203e72307371"
+project_hash = "fc51feac4ebfcd16cf2dfdbcffce9c1a48c871fc"
 
 [[deps.ASL_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
@@ -1044,6 +1044,14 @@ version = "1.6.0+0"
 deps = ["Libdl"]
 uuid = "83775a58-1f1d-513f-b197-d71354ab007a"
 version = "1.2.13+1"
+
+[[deps.lazy_nlp_qd]]
+deps = ["FiniteDiff", "ForwardDiff", "Ipopt", "LinearAlgebra", "MathOptInterface", "SparseArrays"]
+git-tree-sha1 = "33fa305874d789e28831cb0c299b2c37616ebfc4"
+repo-rev = "main"
+repo-url = "https://github.com/kevin-tracy/lazy_nlp_qd.jl.git"
+uuid = "ecc97b5a-e494-4383-ae61-46982ceb46b3"
+version = "0.1.0"
 
 [[deps.libaom_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]

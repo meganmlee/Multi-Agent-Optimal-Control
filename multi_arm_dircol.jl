@@ -22,6 +22,10 @@ using CoordinateTransformations
 import MathOptInterface as MOI
 import Ipopt
 include(joinpath(@__DIR__,"fmincon.jl"))
+Pkg.add(url="https://github.com/kevin-tracy/lazy_nlp_qd.jl.git")
+
+import lazy_nlp_qd
+using SparseArrays
 
 # --- Robot Definition ---
 
@@ -214,7 +218,7 @@ function hermite_simpson(params, x1, x2, u, dt)
 end
 
 # Cost function for optimization
-function point_cost(params, Z)
+function sparse_point_cost(params, Z)
     idx, N, xg = params.idx, params.N, params.xg
     Q, R, Qf = params.Q, params.R, params.Qf
     
@@ -231,6 +235,33 @@ function point_cost(params, Z)
     J += 0.5 * (xn - xg)' * Qf * (xn - xg)
     
     return J 
+end
+
+# Cost gradient function (required for sparse interface)
+function sparse_cost_gradient!(params, grad, Z)
+    idx, N, xg = params.idx, params.N, params.xg
+    Q, R, Qf = params.Q, params.R, params.Qf
+    
+    # Zero out the gradient
+    fill!(grad, 0.0)
+    
+    # Gradient for each state and control
+    for i = 1:(N-1)
+        xi = Z[idx.x[i]]
+        ui = Z[idx.u[i]]
+        
+        # Add state contribution to gradient
+        grad[idx.x[i]] .+= Q * (xi - xg)
+        
+        # Add control contribution to gradient
+        grad[idx.u[i]] .+= R * ui
+    end
+    
+    # Terminal state contribution
+    xn = Z[idx.x[N]]
+    grad[idx.x[N]] .+= Qf * (xn - xg)
+    
+    return nothing
 end
 
 # Dynamics constraints
@@ -251,47 +282,42 @@ function dynamics_constraints(params, Z)
     return c 
 end
 
-# All equality constraints
-function equality_constraint(params, Z)
-    N, idx, x0, xg = params.N, params.idx, params.x0, params.xg 
-    
-    # Dynamics constraints
-    c_dyn = dynamics_constraints(params, Z)
-    
-    # Initial state constraint
-    c_init = Z[idx.x[1]] - x0
-    
-    # Final state constraint for position only, velocity and acceleration are free
-    c_final_pos1 = Z[idx.x[N]][1:NJ] - xg[1:NJ]
-    c_final_pos2 = Z[idx.x[N]][NX_PER_ROBOT+1:NX_PER_ROBOT+NJ] - xg[NX_PER_ROBOT+1:NX_PER_ROBOT+NJ]
-    
-    # Stack all equality constraints
-    return [c_dyn; c_init; c_final_pos1; c_final_pos2]
-end
-
-# Collision and state limits inequality constraints
-function inequality_constraint(params, Z)
+# Combined constraint function for all constraints
+function sparse_constraint!(params, cval, Z)
     N, idx = params.N, params.idx
     robot_kin1, robot_kin2 = params.robot_kin[1], params.robot_kin[2]
     P_links = params.P_links
-    collision_threshold = params.collision_threshold
     
-    # Calculate the number of constraints correctly
-    # State limits for position, velocity, acceleration (upper & lower bounds)
-    n_state_limits_per_robot = N * 3 * NJ * 2
-    n_state_limits = NUM_ROBOTS * n_state_limits_per_robot
-    
-    # Collision constraints between robots
-    n_collision_constraints = N * N_LINKS * N_LINKS
-    
-    # Total inequality constraints
-    n_ineq = n_state_limits + n_collision_constraints
-    
-    # Initialize constraint vector with correct size
-    c = zeros(eltype(Z), n_ineq)
     constraint_idx = 1
     
-    # 1. State Limits for both robots at each knot point
+    # 1. Dynamics constraints (Hermite-Simpson)
+    for i = 1:(N-1)
+        xi = Z[idx.x[i]]
+        ui = Z[idx.u[i]] 
+        xip1 = Z[idx.x[i+1]]
+        
+        # Calculate Hermite-Simpson constraint
+        c_dyn_i = hermite_simpson(params, xi, xip1, ui, params.dt)
+        
+        # Store in constraint vector
+        cval[constraint_idx:constraint_idx+idx.nx-1] = c_dyn_i
+        constraint_idx += idx.nx
+    end
+    
+    # 2. Initial state constraint
+    cval[constraint_idx:constraint_idx+idx.nx-1] = Z[idx.x[1]] - params.x0
+    constraint_idx += idx.nx
+    
+    # 3. Final state constraints (position only)
+    # Robot 1 final position
+    cval[constraint_idx:constraint_idx+NJ-1] = Z[idx.x[N]][1:NJ] - params.xg[1:NJ]
+    constraint_idx += NJ
+    
+    # Robot 2 final position
+    cval[constraint_idx:constraint_idx+NJ-1] = Z[idx.x[N]][NX_PER_ROBOT+1:NX_PER_ROBOT+NJ] - params.xg[NX_PER_ROBOT+1:NX_PER_ROBOT+NJ]
+    constraint_idx += NJ
+    
+    # 4. State limit constraints
     for i = 1:N
         x_i = Z[idx.x[i]]
         
@@ -301,45 +327,36 @@ function inequality_constraint(params, Z)
             # Position limits
             q = x_i[offset .+ (1:NJ)]
             for j = 1:NJ
-                # Upper bound: q[j] <= q_max => q[j] - q_max <= 0
-                c[constraint_idx] = q[j] - params.q_lim[r][2][j]
+                # Upper bound: q[j] - q_max <= 0
+                cval[constraint_idx] = q[j] - params.q_lim[r][2][j]
                 constraint_idx += 1
                 
-                # Lower bound: q_min <= q[j] => q_min - q[j] <= 0
-                c[constraint_idx] = params.q_lim[r][1][j] - q[j]
+                # Lower bound: q_min - q[j] <= 0
+                cval[constraint_idx] = params.q_lim[r][1][j] - q[j]
                 constraint_idx += 1
             end
             
             # Velocity limits
             dq = x_i[offset .+ (NJ+1:2*NJ)]
             for j = 1:NJ
-                # Upper bound: dq[j] <= dq_max => dq[j] - dq_max <= 0
-                c[constraint_idx] = dq[j] - params.dq_lim[r][2][j]
+                cval[constraint_idx] = dq[j] - params.dq_lim[r][2][j]
                 constraint_idx += 1
-                
-                # Lower bound: dq_min <= dq[j] => dq_min - dq[j] <= 0
-                c[constraint_idx] = params.dq_lim[r][1][j] - dq[j]
+                cval[constraint_idx] = params.dq_lim[r][1][j] - dq[j]
                 constraint_idx += 1
             end
             
             # Acceleration limits
             ddq = x_i[offset .+ (2*NJ+1:3*NJ)]
             for j = 1:NJ
-                # Upper bound: ddq[j] <= ddq_max => ddq[j] - ddq_max <= 0
-                c[constraint_idx] = ddq[j] - params.ddq_lim[r][2][j]
+                cval[constraint_idx] = ddq[j] - params.ddq_lim[r][2][j]
                 constraint_idx += 1
-                
-                # Lower bound: ddq_min <= ddq[j] => ddq_min - ddq[j] <= 0
-                c[constraint_idx] = params.ddq_lim[r][1][j] - ddq[j]
+                cval[constraint_idx] = params.ddq_lim[r][1][j] - ddq[j]
                 constraint_idx += 1
             end
         end
     end
     
-    # Debugging check
-    @assert constraint_idx - 1 == n_state_limits "Expected $n_state_limits state limit constraints, but used $(constraint_idx-1)"
-    
-    # 2. Collision Avoidance Constraints
+    # 5. Collision constraints
     for i = 1:N
         x_i = Z[idx.x[i]]
         
@@ -374,21 +391,203 @@ function inequality_constraint(params, Z)
                 # Calculate proximity (negative means collision)
                 prox, _ = dc.proximity(P_links[1][link1], P_links[2][link2])
                 
-                # Constraint: prox - collision_threshold > 0
-                # We flip the sign to make it: collision_threshold - prox < 0
-                c[constraint_idx] = collision_threshold - prox
+                # Constraint: collision_threshold - prox <= 0
+                cval[constraint_idx] = params.collision_threshold - prox
                 constraint_idx += 1
             end
         end
     end
     
-    @assert constraint_idx - 1 == n_ineq "Expected $n_ineq constraints total, but used $(constraint_idx-1)"
-    
-    return c
+    return nothing
 end
 
-# Main function to set up and solve the optimization problem
-function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_goal1, q_start2, q_goal2)
+# Constraint Jacobian function that provides the sparsity pattern
+function sparse_constraint_jacobian!(params, jac_values, Z)
+    # In the lazy_nlp_qd interface, we only need to assign the non-zero values
+    # since the sparsity pattern is already provided
+    
+    # For demonstration, we'll implement a simple finite difference approximation
+    # In practice, you would calculate this analytically for better performance
+    
+    # Get current constraint values
+    c_current = zeros(size(jac_values, 1))
+    sparse_constraint!(params, c_current, Z)
+    
+    # Finite difference step size
+    h = 1e-8
+    
+    # For each entry in the sparse Jacobian
+    I, J, _ = findnz(jac_values)
+    for idx = 1:length(I)
+        i, j = I[idx], J[idx]
+        
+        # Perturb Z[j]
+        Z_perturbed = copy(Z)
+        Z_perturbed[j] += h
+        
+        # Calculate perturbed constraint
+        c_perturbed = zeros(size(jac_values, 1))
+        sparse_constraint!(params, c_perturbed, Z_perturbed)
+        
+        # Finite difference approximation
+        jac_values[i, j] = (c_perturbed[i] - c_current[i]) / h
+    end
+    
+    return nothing
+end
+
+# Function to create the Jacobian sparsity pattern
+function create_constraint_jacobian_pattern(params)
+    N, idx = params.N, params.idx
+    nz = idx.nz
+    
+    # Calculate the number of constraints
+    n_dyn = (N-1) * idx.nx         # Dynamics constraints
+    n_init = idx.nx                # Initial state
+    n_final = 2 * NJ               # Final position constraints
+    n_eq = n_dyn + n_init + n_final # Total equality constraints
+    
+    n_state_limits = NUM_ROBOTS * N * 3 * NJ * 2  # State limits
+    n_collision = N * N_LINKS * N_LINKS           # Collision constraints
+    n_ineq = n_state_limits + n_collision         # Total inequality constraints
+    
+    n_total = n_eq + n_ineq                       # Total constraints
+    
+    # Initialize I, J vectors for sparse triplet format
+    I = Int[]
+    J = Int[]
+    V = Float64[]
+    
+    # 1. Dynamics constraints
+    con_idx = 0
+    for i = 1:(N-1)
+        for d = 1:idx.nx  # Each state dimension
+            # Current state dependency
+            for s = 1:idx.nx
+                push!(I, con_idx + d)
+                push!(J, idx.x[i][s])
+                push!(V, 1.0)  # Placeholder value
+            end
+            
+            # Current control dependency
+            for u = 1:idx.nu
+                push!(I, con_idx + d)
+                push!(J, idx.u[i][u])
+                push!(V, 1.0)  # Placeholder value
+            end
+            
+            # Next state dependency
+            for s = 1:idx.nx
+                push!(I, con_idx + d)
+                push!(J, idx.x[i+1][s])
+                push!(V, 1.0)  # Placeholder value
+            end
+        end
+        con_idx += idx.nx
+    end
+    
+    # 2. Initial state constraint
+    for d = 1:idx.nx
+        push!(I, con_idx + d)
+        push!(J, idx.x[1][d])
+        push!(V, 1.0)
+    end
+    con_idx += idx.nx
+    
+    # 3. Final position constraints
+    for j = 1:NJ
+        # Robot 1 final position
+        push!(I, con_idx + j)
+        push!(J, idx.x[N][j])
+        push!(V, 1.0)
+    end
+    con_idx += NJ
+    
+    for j = 1:NJ
+        # Robot 2 final position
+        push!(I, con_idx + j)
+        push!(J, idx.x[N][NX_PER_ROBOT + j])
+        push!(V, 1.0)
+    end
+    con_idx += NJ
+    
+    # 4. State limits
+    for i = 1:N
+        for r = 1:NUM_ROBOTS
+            offset = (r - 1) * NX_PER_ROBOT
+            
+            # Position limits
+            for j = 1:NJ
+                # Upper bound
+                push!(I, con_idx + 1)
+                push!(J, idx.x[i][offset + j])
+                push!(V, 1.0)
+                con_idx += 1
+                
+                # Lower bound
+                push!(I, con_idx + 1)
+                push!(J, idx.x[i][offset + j])
+                push!(V, 1.0)
+                con_idx += 1
+            end
+            
+            # Velocity limits
+            for j = 1:NJ
+                push!(I, con_idx + 1)
+                push!(J, idx.x[i][offset + NJ + j])
+                push!(V, 1.0)
+                con_idx += 1
+                
+                push!(I, con_idx + 1)
+                push!(J, idx.x[i][offset + NJ + j])
+                push!(V, 1.0)
+                con_idx += 1
+            end
+            
+            # Acceleration limits
+            for j = 1:NJ
+                push!(I, con_idx + 1)
+                push!(J, idx.x[i][offset + 2*NJ + j])
+                push!(V, 1.0)
+                con_idx += 1
+                
+                push!(I, con_idx + 1)
+                push!(J, idx.x[i][offset + 2*NJ + j])
+                push!(V, 1.0)
+                con_idx += 1
+            end
+        end
+    end
+    
+    # 5. Collision constraints
+    for i = 1:N
+        for link1 = 1:N_LINKS
+            for link2 = 1:N_LINKS
+                # Dependencies on robot 1 joint positions
+                for j = 1:NJ
+                    push!(I, con_idx + 1)
+                    push!(J, idx.x[i][j])
+                    push!(V, 1.0)
+                end
+                
+                # Dependencies on robot 2 joint positions
+                for j = 1:NJ
+                    push!(I, con_idx + 1)
+                    push!(J, idx.x[i][NX_PER_ROBOT + j])
+                    push!(V, 1.0)
+                end
+                
+                con_idx += 1
+            end
+        end
+    end
+    
+    # Create the sparse matrix with the pattern
+    return sparse(I, J, V, n_total, nz)
+end
+
+# Modified solve function to use lazy_nlp_qd.sparse_fmincon
+function solve_trajectory_dircol_sparse(robot_kin1, robot_kin2, P_links, q_start1, q_goal1, q_start2, q_goal2)
     # Problem dimensions
     N = 51            # Number of knot points
     dt = 0.1          # Time step
@@ -412,7 +611,6 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     R = R_jerk_weight * Diagonal(ones(NU))
     
     # Constraint limits
-    # Joint position limits (same for both robots)
     q_lim_single = (fill(Q_LIMITS[1], NJ), fill(Q_LIMITS[2], NJ))
     dq_lim_single = (fill(DQ_LIMITS[1], NJ), fill(DQ_LIMITS[2], NJ))
     ddq_lim_single = (fill(DDQ_LIMITS[1], NJ), fill(DDQ_LIMITS[2], NJ))
@@ -444,23 +642,7 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
         collision_threshold = COLLISION_THRESHOLD
     )
     
-    # Calculate constraint dimensions for verification
-    # Calculate the number of constraints correctly
-    # State limits
-    n_state_limits_per_robot = N * 3 * NJ * 2
-    n_state_limits = NUM_ROBOTS * n_state_limits_per_robot
-    
-    # Collision constraints
-    n_collision_constraints = N * N_LINKS * N_LINKS
-    
-    # Total inequality constraints
-    n_ineq = n_state_limits + n_collision_constraints
-    
-    println("Number of inequality constraints: $n_ineq")
-    println("- State limits: $n_state_limits")
-    println("- Collision constraints: $n_collision_constraints")
-    
-    # Initial guess - linear interpolation
+    # Initial guess - linear interpolation (same as before)
     z0 = zeros(idx.nz)
     for i = 1:N
         x_idx = idx.x[i]
@@ -520,22 +702,59 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     x_l[idx.x[1]] = x0
     x_u[idx.x[1]] = x0
     
-    # Inequality constraint bounds
-    c_ineq_l = -Inf * ones(n_ineq)
-    c_ineq_u = zeros(n_ineq)  # All constraints are of form g(x) <= 0
+    # Create Jacobian sparsity pattern
+    jac_pattern = create_constraint_jacobian_pattern(params)
     
-    # Test the inequality constraint function with our initial guess
-    println("Testing inequality constraint function...")
-    c_test = inequality_constraint(params, z0)
-    println("Length of constraint vector: $(length(c_test))")
+    # Calculate number of constraints
+    n_dyn = (N-1) * idx.nx  # Dynamics
+    n_init = idx.nx         # Initial state
+    n_final = 2 * NJ        # Final position
+    n_eq = n_dyn + n_init + n_final
     
-    println("Starting trajectory optimization using direct collocation...")
+    n_state_limits = NUM_ROBOTS * N * 3 * NJ * 2
+    n_collision = N * N_LINKS * N_LINKS
+    n_ineq = n_state_limits + n_collision
     
-    # Solve the optimization problem
-    diff_type = :finite  # Use ForwardDiff for derivatives
-    Z = fmincon(point_cost, equality_constraint, inequality_constraint,
-                x_l, x_u, c_ineq_l, c_ineq_u, z0, params, diff_type;
-                tol=1e-2, c_tol=1e-2, max_iters=3000, verbose=true)
+    n_total = n_eq + n_ineq
+    
+    # Constraint bounds
+    c_l = zeros(n_total)
+    c_u = zeros(n_total)
+    
+    # Equality constraints (all zeros)
+    c_l[1:n_eq] .= 0.0
+    c_u[1:n_eq] .= 0.0
+    
+    # Inequality constraints for state limits
+    c_l[n_eq+1:n_eq+n_state_limits] .= -Inf  # g(x) <= 0 form
+    c_u[n_eq+1:n_eq+n_state_limits] .= 0.0
+    
+    # Inequality constraints for collision avoidance
+    c_l[n_eq+n_state_limits+1:n_total] .= -Inf  # collision_threshold - prox <= 0
+    c_u[n_eq+n_state_limits+1:n_total] .= 0.0
+    
+    println("Starting trajectory optimization using sparse direct collocation...")
+    println("Number of constraints: $n_total (Equality: $n_eq, Inequality: $n_ineq)")
+    println("Number of non-zeros in Jacobian: $(nnz(jac_pattern))")
+    
+    # Solve using lazy_nlp_qd.sparse_fmincon
+    Z = lazy_nlp_qd.sparse_fmincon(
+        sparse_point_cost,
+        sparse_cost_gradient!,
+        sparse_constraint!,
+        sparse_constraint_jacobian!,
+        jac_pattern,
+        x_l,
+        x_u,
+        c_l,
+        c_u,
+        z0,
+        params;
+        tol = 1e-2,
+        c_tol = 1e-2,
+        max_iters = 3000,
+        print_level = 5
+    )
     
     println("Optimization complete!")
     
