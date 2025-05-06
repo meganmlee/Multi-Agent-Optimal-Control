@@ -692,8 +692,6 @@ function main()
         println("Setting Animation...")
         mc.setanimation!(vis, anim)
         println("Done. Check MeshCat visualizer.")
-        
-        return X_sol, U_sol
     end
 end
 
