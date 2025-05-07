@@ -247,86 +247,95 @@ function eval_mask(μv,huv)
     mask
 end
 
-function iLQR(params,X,U,P,p,K,d,Xn,Un;atol=1e-3,max_iters = 250,verbose = true,ρ=1,ϕ=10)
-
+function iLQR(params, X, U, P, p, K, d, Xn, Un; atol=1e-3, max_iters=250, verbose=true, ρ=1, ϕ=10)
+    
     # first check the sizes of everything
     @assert length(X) == params.N
     @assert length(U) == params.N-1
     @assert length(X[1]) == params.nx
     @assert length(U[1]) == params.nu
-    @assert length(ineq_con_u(params,U[1])) == params.ncu
-    @assert length(ineq_con_x(params,X[1])) == params.ncx
+    @assert length(ineq_con_u(params, U[1])) == params.ncu
+    @assert length(ineq_con_x(params, X[1])) == params.ncx
 
     # keep track of trajectories for each iterate
-    Xhist=[deepcopy(X) for i = 1:1000]
+    Xhist = [deepcopy(X) for i = 1:1000]
+
+    # Start timing for convergence
+    start_time = time()
 
     # initial rollout
     N = params.N
     for i = 1:N-1
-        X[i+1] = discrete_dynamics(params,X[i],U[i],i)
+        X[i+1] = discrete_dynamics(params, X[i], U[i], i)
     end
 
     Xhist[1] .= X
-
 
     reg_min = 1e-6
     reg = reg_min
     reg_max = 1e2
 
     μ = [zeros(params.ncu) for i = 1:N-1]
-
     μx = [zeros(params.ncx) for i = 1:N]
-
     λ = zeros(params.nx)
 
+    if verbose
+        @printf "iter     J           ΔJ        |d|         α        reg         ρ      time(s)\n"
+        @printf "----------------------------------------------------------------------------\n"
+    end
+
     for iter = 1:max_iters
-        ΔJ = backward_pass!(params,X,U,P,p,d,K,reg,μ,μx,ρ,λ)
-        J, α = forward_pass!(params,X,U,K,d,ΔJ,Xn,Un,μ,μx,ρ,λ)
+        ΔJ = backward_pass!(params, X, U, P, p, d, K, reg, μ, μx, ρ, λ)
+        J, α = forward_pass!(params, X, U, K, d, ΔJ, Xn, Un, μ, μx, ρ, λ)
 
         Xhist[iter + 1] .= X
 
-        reg = update_reg(reg,reg_min,reg_max,α)
+        reg = update_reg(reg, reg_min, reg_max, α)
         dmax = calc_max_d(d)
+        
+        # Calculate elapsed time
+        elapsed_time = time() - start_time
+        
         if verbose
-            if rem(iter-1,10)==0
-                @printf "iter     J           ΔJ        |d|         α        reg         ρ\n"
-                @printf "---------------------------------------------------------------------\n"
-            end
-            @printf("%3d   %10.3e  %9.2e  %9.2e  %6.4f   %9.2e   %9.2e\n",
-              iter, J, ΔJ, dmax, α, reg,ρ)
+            # Modified to include time
+            @printf("%3d   %10.3e  %9.2e  %9.2e  %6.4f   %9.2e   %9.2e   %9.2f\n",
+              iter, J, ΔJ, dmax, α, reg, ρ, elapsed_time)
         end
-        if (α > 0) & (dmax<atol)
+        
+        if (α > 0) & (dmax < atol)
             # check convio
             convio = 0
 
             # control constraints
             for k = 1:N-1
-                huv = ineq_con_u(params,U[k])
-                mask = eval_mask(μ[k],huv)
+                huv = ineq_con_u(params, U[k])
+                mask = eval_mask(μ[k], huv)
 
                 # update dual
-                μ[k] = max.(0,μ[k] + ρ*mask*huv)
-                convio = max(convio,norm(huv + abs.(huv),Inf))
+                μ[k] = max.(0, μ[k] + ρ * mask * huv)
+                convio = max(convio, norm(huv + abs.(huv), Inf))
             end
 
             # state constraints
             for k = 1:N
-                hxv = ineq_con_x(params,X[k])
-                mask = eval_mask(μx[k],hxv)
+                hxv = ineq_con_x(params, X[k])
+                mask = eval_mask(μx[k], hxv)
 
                 # update dual
-                μx[k] = max.(0,μx[k] + ρ*mask*hxv)
-                convio = max(convio,norm(hxv + abs.(hxv),Inf))
+                μx[k] = max.(0, μx[k] + ρ * mask * hxv)
+                convio = max(convio, norm(hxv + abs.(hxv), Inf))
             end
 
             # goal constraint
             hxv = X[N] - params.Xref[N]
-            λ .+= ρ*hxv
-            convio = max(convio, norm(hxv,Inf))
+            λ .+= ρ * hxv
+            convio = max(convio, norm(hxv, Inf))
 
             @show convio
-            if convio <1e-4
-                @info "success!"
+            if convio < 1e-4
+                # Calculate final convergence time
+                convergence_time = time() - start_time
+                @info "Success! Converged in $(iter) iterations and $(convergence_time) seconds"
                 return Xhist[1:(iter + 1)]
             end
 

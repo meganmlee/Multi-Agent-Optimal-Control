@@ -551,6 +551,7 @@ function main()
         # --- Simulation Parameters ---
         N = 51 # Fewer steps initially for faster debugging
         dt = 0.1
+        trajectory_time = (N-1) * dt
 
         # --- Start and Goal States (Adjust for 6/7 DOF) ---
         q_start1 = [0.0, 0, 0.0, 0.0, -π/2, 0.0]  # Robot 1 start configuration
@@ -617,6 +618,7 @@ function main()
                     atol=1e-1, max_iters=3000, verbose=true, ρ=1.0, ϕ=10.0) # Adjust params for potentially harder problem
 
         println("iLQR Finished.")
+        println("Trajectory execution time: $(trajectory_time) seconds")
         X_sol = Xhist[end]
 
         # --- Visualization ---

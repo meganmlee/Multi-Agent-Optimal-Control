@@ -213,6 +213,9 @@ function iLQR(params,X,U,P,p,K,d,Xn,Un;atol=1e-3,max_iters = 250,verbose = true,
     # keep track of trajectories for each iterate
     Xhist=[deepcopy(X) for i = 1:1000]
 
+    # Start timing for convergence
+    start_time = time()
+
     # initial rollout
     N = params.N
     for i = 1:N-1
@@ -242,11 +245,15 @@ function iLQR(params,X,U,P,p,K,d,Xn,Un;atol=1e-3,max_iters = 250,verbose = true,
         dmax = calc_max_d(d)
         if verbose
             if rem(iter-1,10)==0
-                @printf "iter     J           ΔJ        |d|         α        reg         ρ\n"
-                @printf "---------------------------------------------------------------------\n"
+                @printf "iter     J           ΔJ        |d|         α        reg         ρ      time(s)\n"
+        @printf "----------------------------------------------------------------------------\n"
             end
-            @printf("%3d   %10.3e  %9.2e  %9.2e  %6.4f   %9.2e   %9.2e\n",
-              iter, J, ΔJ, dmax, α, reg,ρ)
+
+            # Calculate elapsed time
+            elapsed_time = time() - start_time
+
+            @printf("%3d   %10.3e  %9.2e  %9.2e  %6.4f   %9.2e   %9.2e   %9.2f\n",
+              iter, J, ΔJ, dmax, α, reg, ρ, elapsed_time)
         end
         if (α > 0) & (dmax<atol)
             # check convio
@@ -279,7 +286,8 @@ function iLQR(params,X,U,P,p,K,d,Xn,Un;atol=1e-3,max_iters = 250,verbose = true,
 
             @show convio
             if convio <1e-4
-                @info "success!"
+                convergence_time = time() - start_time
+                @info "Success! Converged in $(iter) iterations and $(convergence_time) seconds"
                 return Xhist[1:(iter + 1)]
             end
 

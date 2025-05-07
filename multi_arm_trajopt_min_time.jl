@@ -655,6 +655,24 @@ function main()
         println("iLQR Finished.")
         X_sol = Xhist[end]
 
+        # --- Extract optimized control sequence (including time scaling factors) ---
+        U_sol = []
+        for i = 1:N-1
+            # Calculate control at this timestep using the optimized gains
+            u_i = U[i] - d[i] - K[i]*(X_sol[i] - X[i])
+            push!(U_sol, u_i)
+        end
+        
+        # --- Calculate total trajectory time from h values ---
+        total_time = 0.0
+        for i = 1:N-1
+            h_i = U_sol[i][1]  # Extract the time scaling factor
+            dt_i = dt * h_i    # Actual timestep duration
+            total_time += dt_i
+        end
+        
+        println("Optimized Trajectory Time: $(total_time) seconds")
+
         # --- Visualization ---
         println("Setting up Visualization...")
         vis = mc.Visualizer()
