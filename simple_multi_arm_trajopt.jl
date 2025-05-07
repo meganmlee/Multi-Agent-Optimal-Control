@@ -550,6 +550,7 @@ function main()
 
         # --- Parameters Bundle ---
         params = (
+            min_time = false,
             nx = NX,
             nu = NU,
             ncx = ncx,

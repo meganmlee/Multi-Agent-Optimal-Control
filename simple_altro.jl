@@ -14,7 +14,7 @@ function stage_cost(p::NamedTuple,x,u,k)
         dx = x - p.Xref[k]
         du = u[2:end] - p.Uref[k][2:end]
         h = u[1]
-        return 0.5*dx'*p.Q*dx + 0.5*du'*p.R[2:end, 2:end]*du + h
+        return (0.5*dx'*p.Q*dx + 0.5*du'*p.R[2:end, 2:end]*du) * h
     else
         dx = x - p.Xref[k]
         du = u - p.Uref[k]

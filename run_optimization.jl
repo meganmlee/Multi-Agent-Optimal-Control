@@ -58,7 +58,7 @@ function setup_ilqr_params(x0, xg, N, dt, robot_kin1, robot_kin2, cost_params, l
     # Calculate ncx, ncu dynamically (important!)
     if cost_params.min_time
         Uref = [[1.0 ; zeros(T, NU-1)] for i = 1:N-1]
-        h_min = 0.3; h_max = 5.0
+        h_min = 0.08; h_max = 5.0
         temp_params_for_eval = (;
             min_time = cost_params.min_time,
             robot_kin=[robot_kin1, robot_kin2], q_lim=q_lim_all, dq_lim=dq_lim_all, ddq_lim=ddq_lim_all,

@@ -93,6 +93,7 @@ let
     ncu = 2*nu
 
     params = (
+        min_time = false,
         nx = nx,
         nu = nu,
         ncx = ncx,

@@ -161,6 +161,7 @@ function visualize_case(filepath::String; run_warm::Bool = true, run_cold::Bool 
                 fps = 30.0
             end
             
+            #animate_trajectory(vis, X_warm_init, params.robot_kin, params.P_links, link_vis_names, fps)
             animate_trajectory(vis, results_warm[:X_sol], params.robot_kin, params.P_links, link_vis_names, fps)
             println("Warm start animation set. Press Enter to continue...")
             readline() # Pause
@@ -205,4 +206,4 @@ end
 # --- Execution Example ---
 const TRAJ_TO_VISUALIZE = "solutions/right_push_left_push_up.csv" # <--- SET THIS PATH
 
-visualize_case(TRAJ_TO_VISUALIZE; run_warm=true, run_cold=false, run_min_time=true)
+visualize_case(TRAJ_TO_VISUALIZE; run_warm=false, run_cold=true, run_min_time=true)
