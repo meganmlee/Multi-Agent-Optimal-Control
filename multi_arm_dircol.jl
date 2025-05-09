@@ -8,6 +8,7 @@ Pkg.add(["LinearAlgebra", "StaticArrays", "ForwardDiff", "FiniteDiff", "Printf",
          "Ipopt", "MathOptInterface"])
 
 import DifferentiableCollisions as dc
+using Statistics
 using LinearAlgebra
 using StaticArrays
 import ForwardDiff as FD
@@ -47,7 +48,7 @@ const N_LINKS = NUM_JOINTS_PER_ROBOT # Assume one collision body per joint frame
 const NX_PER_ROBOT = 3 * NJ
 const NX = NUM_ROBOTS * NX_PER_ROBOT
 const NU_PER_ROBOT = NJ
-const NU = NUM_ROBOTS * NU_PER_ROBOT
+const NU = NUM_ROBOTS * NU_PER_ROBOT + 1 # add one for time variable
 
 # Dynamics & Limits (per joint) - Keep these generic for now
 const Q_LIMITS = (-π, π) # Generic limits, refine per robot if needed
@@ -57,6 +58,9 @@ const JERK_LIMITS = (-10.0, 10.0)
 
 # Collision
 const COLLISION_THRESHOLD = 1.0 # DCOL proximity value threshold
+
+# Time (h rnage)
+const TIME_SCALING_LIMITS = (0.3, 5.0)
 
 """
 skew(v) - Computes the skew-symmetric matrix (remains the same)
@@ -177,6 +181,9 @@ function create_idx(nx, nu, N)
 end
 
 function robot_dynamics(x, u)
+    # Time scaling 
+    h = u[1]
+
     # Robot 1
     dq1 = x[NJ+1:2*NJ]
     ddq1 = x[2*NJ+1:3*NJ]
@@ -186,13 +193,13 @@ function robot_dynamics(x, u)
     ddq2 = x[NX_PER_ROBOT+2*NJ+1:NX_PER_ROBOT+3*NJ]
     
     # Extract control inputs (jerks)
-    jerk1 = u[1:NJ]
-    jerk2 = u[NU_PER_ROBOT+1:NU]
+    jerk1 = u[2:NJ+1]
+    jerk2 = u[NU_PER_ROBOT+2:NU]
     
     # Triple integrator dynamics
     xdot = vcat(
-        dq1, ddq1, jerk1, # Robot 1
-        dq2, ddq2, jerk2  # Robot 2
+        h .* dq1, h .* ddq1, h .* jerk1,  # Robot 1
+        h .* dq2, h .* ddq2, h .* jerk2   # Robot 2
     )
     
     return xdot
@@ -214,16 +221,25 @@ function hermite_simpson(params, x1, x2, u, dt)
 end
 
 # Cost function for optimization
-function point_cost(params, Z)
+function cost(params, Z)
     idx, N, xg = params.idx, params.N, params.xg
     Q, R, Qf = params.Q, params.R, params.Qf
+    time_cost_weight = params.time_cost_weight
     
     J = 0.0
     for i = 1:(N-1)
         xi = Z[idx.x[i]]
         ui = Z[idx.u[i]]
-       
-        J += 0.5 * ((xi - xg)' * Q * (xi - xg)) + 0.5 * (ui' * R * ui)
+        h = ui[1]
+
+        J += 0.5 * ((xi - xg)' * Q * (xi - xg))
+
+        # Control cost for jerks
+        jerks = ui[2:end]
+        J += 0.5 * (jerks' * R[2:end, 2:end] * jerks)
+        
+        # Time cost
+        J += time_cost_weight * h
     end
     
     # terminal cost 
@@ -390,9 +406,9 @@ end
 # Main function to set up and solve the optimization problem
 function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_goal1, q_start2, q_goal2)
     # Problem dimensions
-    N = 51            # Number of knot points
+    N = 10            # Number of knot points
     dt = 0.1          # Time step
-    tf = (N-1) * dt   # Final time
+    # tf = (N-1) * dt   # Final time
     
     # Create indexing
     idx = create_idx(NX, NU, N)
@@ -409,7 +425,10 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     Qf_diag_single = vcat(fill(Qf_q_weight, NJ), fill(Qf_dq_weight, NJ), fill(Qf_ddq_weight, NJ))
     Qf = Diagonal(vcat(Qf_diag_single, Qf_diag_single))
     R_jerk_weight = 0.01
-    R = R_jerk_weight * Diagonal(ones(NU))
+    R_time_weight = 0.001  # Small weight for time variable
+    R = Diagonal(vcat([R_time_weight], fill(R_jerk_weight, NU-1)))
+
+    time_cost_weight = 2.0
     
     # Constraint limits
     # Joint position limits (same for both robots)
@@ -420,9 +439,9 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     dq_lim_all = [dq_lim_single, dq_lim_single]
     ddq_lim_all = [ddq_lim_single, ddq_lim_single]
     
-    # Control limits (jerk)
-    u_min = fill(JERK_LIMITS[1], NU)
-    u_max = fill(JERK_LIMITS[2], NU)
+    # Control limits (time scaling and jerk)
+    u_min = vcat([TIME_SCALING_LIMITS[1]], fill(JERK_LIMITS[1], NU-1))
+    u_max = vcat([TIME_SCALING_LIMITS[2]], fill(JERK_LIMITS[2], NU-1))
     
     # Parameters bundle
     params = (
@@ -434,6 +453,7 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
         Q = Q,
         R = R,
         Qf = Qf,
+        time_cost_weight = time_cost_weight,
         q_lim = q_lim_all,
         dq_lim = dq_lim_all,
         ddq_lim = ddq_lim_all,
@@ -481,7 +501,7 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     # Set initial control inputs to zero
     for i = 1:N-1
         u_idx = idx.u[i]
-        z0[u_idx] = zeros(NU)
+        z0[u_idx] = vcat([1.0], zeros(NU-1))
     end
     
     # Bounds for decision variables
@@ -533,7 +553,7 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     
     # Solve the optimization problem
     diff_type = :finite  # Use ForwardDiff for derivatives
-    Z = fmincon(point_cost, equality_constraint, inequality_constraint,
+    Z = fmincon(cost, equality_constraint, inequality_constraint,
                 x_l, x_u, c_ineq_l, c_ineq_u, z0, params, diff_type;
                 tol=1e-2, c_tol=1e-2, max_iters=3000, verbose=true)
     
@@ -542,8 +562,20 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     # Extract optimal trajectories
     X = [Z[idx.x[i]] for i = 1:N]
     U = [Z[idx.u[i]] for i = 1:N-1]
+
+    # Extract and print time scaling factors
+    time_scaling = [U[i][1] for i = 1:N-1]
+    println("Time scaling factors: ", time_scaling)
+    println("Average time scaling: ", mean(time_scaling))
     
-    return X, U
+    # Calculate actual time points based on scaling
+    time_points = zeros(N)
+    for i = 2:N
+        time_points[i] = time_points[i-1] + dt * U[i-1][1]
+    end
+    println("Total trajectory time: ", time_points[end])
+    
+    return X, U, time_points
 end
 
 function main()
@@ -621,8 +653,13 @@ function main()
         q_goal2 = [0.0, π/5, π/5, 0, π/2, 0.0]
 
         # Solve using direct collocation
-        X_sol, U_sol = solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, 
+        X_sol, U_sol, time_points = solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, 
                                              q_start1, q_goal1, q_start2, q_goal2)
+
+        # Print time information
+        println("Time scaling factors: ", [U_sol[i][1] for i = 1:length(U_sol)])
+        println("Time points: ", time_points)
+        println("Total trajectory time: ", time_points[end])
 
         # Visualization setup
         println("Setting up Visualization...")
@@ -656,32 +693,62 @@ function main()
         end
 
         # Animate the solution
-        dt = 0.1
         N = length(X_sol)
-        anim = mc.Animation(floor(Int, 1 / dt))
-        println("Creating Animation...")
-        for k = 1:N
-            mc.atframe(anim, k) do
-                x_k = X_sol[k]
-                q1_k = x_k[1:NJ]
-                q2_k = x_k[NX_PER_ROBOT .+ (1:NJ)]
-                all_q_k = [q1_k, q2_k]
-
+        
+        # Calculate display dt based on final time
+        final_time = time_points[end]
+        display_fps = 60
+        display_dt = 1/display_fps
+        num_frames = ceil(Int, final_time * display_fps)
+        
+        anim = mc.Animation(Int(display_fps))
+        println("Creating Animation with $num_frames frames...")
+        
+        # Create interpolation function for states
+        function interpolate_state(t)
+            # Find the right segment
+            i = 1
+            while i < N && time_points[i+1] < t
+                i += 1
+            end
+            
+            # If at or past the end, return the last state
+            if i >= N || t >= time_points[end]
+                return X_sol[end]
+            end
+            
+            # Linear interpolation within segment
+            t1 = time_points[i]
+            t2 = time_points[i+1]
+            s = (t - t1) / (t2 - t1)  # Interpolation factor
+            
+            return (1-s) * X_sol[i] + s * X_sol[i+1]
+        end
+        
+        # Create frames at regular time intervals
+        for frame = 1:num_frames
+            t = (frame - 1) * display_dt
+            mc.atframe(anim, frame) do
+                x_t = interpolate_state(t)
+                q1_t = x_t[1:NJ]
+                q2_t = x_t[NX_PER_ROBOT .+ (1:NJ)]
+                all_q_t = [q1_t, q2_t]
+                
                 for r = 1:NUM_ROBOTS
                     # Calculate FK for current robot
                     robot_kin_r = (r == 1) ? robot_kin1 : robot_kin2
-                    poses_world_k, _, _, _ = forward_kinematics_poe(all_q_k[r], robot_kin_r)
-
+                    poses_world_t, _, _, _ = forward_kinematics_poe(all_q_t[r], robot_kin_r)
+                    
                     for l = 1:N_LINKS
                         primitive_obj = P_links[r][l]
-                        T_link_center = poses_world_k[l]
+                        T_link_center = poses_world_t[l]
                         pos = T_link_center.translation
                         rot = RotMatrix(T_link_center.linear)
-
+                        
                         # Update DCOL primitive state
                         primitive_obj.r = pos
                         primitive_obj.p = Rotations.params(Rotations.MRP(rot))
-
+                        
                         # Update Meshcat visualization
                         vis_name = link_vis_names[r][l]
                         dc.update_pose!(vis[vis_name], primitive_obj)
@@ -689,11 +756,12 @@ function main()
                 end
             end
         end
+        
         println("Setting Animation...")
         mc.setanimation!(vis, anim)
         println("Done. Check MeshCat visualizer.")
+        end
     end
-end
 
 # Run the main function
 main()
