@@ -16,6 +16,7 @@ struct ProblemMOI <: MOI.AbstractNLPEvaluator
     cost # ::Function
     con # ::Function
     diff_type # :Symbol
+    analytical_constraint_jacobian_func::Union{Function, Nothing} # Added for analytical Jacobian
 end
 
 #this function was checked
@@ -24,7 +25,8 @@ function ProblemMOI(n_nlp,m_nlp,params,cost,con,diff_type;
         con_jac=true,
         sparsity_jac=sparsity_jacobian(n_nlp,m_nlp),
         sparsity_hess=sparsity_hessian(n_nlp,m_nlp),
-        hessian_lagrangian=false)
+        hessian_lagrangian=false,
+        analytical_constraint_jacobian_func=nothing)
 
     ProblemMOI(n_nlp,m_nlp,
         obj_grad,
@@ -35,7 +37,8 @@ function ProblemMOI(n_nlp,m_nlp,params,cost,con,diff_type;
         params,
         cost,
         con,
-        diff_type)
+        diff_type,
+        analytical_constraint_jacobian_func)
 
 end
 
@@ -84,7 +87,7 @@ end
 
 function MOI.eval_objective_gradient(prob::MOI.AbstractNLPEvaluator, grad_f, x)
     _cost(_x) = prob.cost(prob.params, _x)
-    if prob.diff_type == :auto 
+    if prob.diff_type == :auto || prob.diff_type == :analytical
         ForwardDiff.gradient!(grad_f,_cost,x)
     else
         FiniteDiff.finite_difference_gradient!(grad_f, _cost, x)
@@ -101,8 +104,17 @@ function MOI.eval_constraint_jacobian(prob::MOI.AbstractNLPEvaluator, jac, x)
     _con(_x) = prob.con(prob.params, _x)
     if prob.diff_type == :auto 
         reshape(jac,prob.m_nlp,prob.n_nlp) .= ForwardDiff.jacobian(_con, x)
-    else
+    elseif prob.diff_type == :finite
         reshape(jac,prob.m_nlp,prob.n_nlp) .= FiniteDiff.finite_difference_jacobian(_con, x)
+    elseif prob.diff_type == :analytical && prob.analytical_constraint_jacobian_func !== nothing
+        analytical_jac_matrix = prob.analytical_constraint_jacobian_func(prob.params, x)
+        # Ensure dimensions match, though this should be handled by the user function
+        if size(analytical_jac_matrix) != (prob.m_nlp, prob.n_nlp)
+            error("Analytical Jacobian dimensions mismatch. Expected ($(prob.m_nlp), $(prob.n_nlp)), Got $(size(analytical_jac_matrix))")
+        end
+        reshape(jac, prob.m_nlp, prob.n_nlp) .= analytical_jac_matrix
+    else
+        error("Unsupported diff_type ('$(prob.diff_type)') or missing analytical_constraint_jacobian_func for constraints.")
     end
     return nothing
 end
@@ -178,6 +190,7 @@ function fmincon(cost::Function,
                  x0::Vector,
                  params::NamedTuple,
                  diff_type::Symbol;
+                 analytical_constraint_jacobian::Union{Function, Nothing}=nothing,
                  tol = 1e-4,
                  c_tol = 1e-4,
                  max_iters = 1_000,
@@ -206,11 +219,13 @@ function fmincon(cost::Function,
     
     if diff_type == :auto 
         verbose && println("---------diff type set to :auto (ForwardDiff.jl)----")
+    elseif diff_type == :analytical
+        verbose && println("---------diff type set to :auto for objective (ForwardDiff.jl), custom analytical for constarint ----")
     else
         verbose && println("---------diff type set to :finite (FiniteDiff.jl)---")
     end
     verbose && println("---------testing objective gradient-----------------")
-    if diff_type == :auto 
+    if diff_type == :auto || diff_type == :analytical
         ForwardDiff.gradient(_x -> cost(params, _x), x0)
     else
         FiniteDiff.finite_difference_gradient(_x -> cost(params, _x), x0)
@@ -218,12 +233,18 @@ function fmincon(cost::Function,
     verbose && println("---------testing constraint Jacobian----------------")
     if diff_type == :auto 
         ForwardDiff.jacobian(_x -> con(params, _x), x0)
+    elseif diff_type == :analytical
+        if analytical_constraint_jacobian === nothing
+            error("Analytical Jacobian function is not provided for constraints.")
+        end
+        analytical_constraint_jacobian(params, x0)
     else
         FiniteDiff.finite_difference_jacobian(_x -> con(params, _x), x0)
     end    
     verbose && println("---------successfully compiled both derivatives-----")
     
-    prob = ProblemMOI(n_primals, n_eq + n_ineq, params, cost, con, diff_type)
+    prob = ProblemMOI(n_primals, n_eq + n_ineq, params, cost, con, diff_type; 
+            analytical_constraint_jacobian_func=analytical_constraint_jacobian)
 
     # add zeros(n_eq) for equality constraint
     nlp_bounds = MOI.NLPBoundsPair.([zeros(n_eq); c_l],[zeros(n_eq); c_u])

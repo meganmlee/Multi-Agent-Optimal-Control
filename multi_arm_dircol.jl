@@ -161,6 +161,79 @@ function forward_kinematics_poe(q::AbstractVector{Q_T}, robot_kin::RobotKinemati
     return link_center_poses_world, joint_frames_world, world_joint_axes, world_joint_positions
 end
 
+# --- Updated Analytical Jacobian (Geometric Approach for 3D) ---
+
+"""
+B_matrix_mrp(p) - Remains the same
+"""
+@inline function B_matrix_mrp(p::AbstractVector{T}) where T
+    p_sq_norm = dot(p, p)
+    I3 = SMatrix{3,3,T,9}(1.0I)
+    p_outer = p * p'
+    p_skew = skew(p)
+    B = T(0.25) * ((T(1.0) - p_sq_norm) * I3 + T(2.0) * p_skew + T(2.0) * p_outer)
+    return B
+end
+
+"""
+calculate_link_pose_jacobian_geom(q_r, link_idx, robot_kin)
+
+Calculates the analytical Jacobian (6xNJ) of a link's pose [r; p]
+with respect to the robot's joint angles q_r using the geometric method.
+"""
+function calculate_link_pose_jacobian_geom(q_r::AbstractVector{T}, link_idx::Int, robot_kin::RobotKinematics{T_kin}) where {T, T_kin}
+    NJ = length(q_r)
+    nx_pose = 6 # Size of [r; p]
+    J_pose = zeros(T, nx_pose, NJ)
+
+    # --- Perform FK to get necessary info ---
+    link_center_poses, _, world_joint_axes, world_joint_positions = forward_kinematics_poe(q_r, robot_kin)
+
+    # Target link's center position and orientation (MRP) in world frame
+    T_link_center_world = link_center_poses[link_idx]
+    r_i = T_link_center_world.translation
+    R_i = T_link_center_world.linear
+    p_i = Rotations.params(Rotations.MRP(R_i))
+
+    # --- Calculate Jacobians ---
+    J_w = @view J_pose[4:6, :] # Angular velocity Jacobian part
+
+    # Position Jacobian J_r (Rows 1-3) & Angular Jacobian J_w (Rows 4-6)
+    for j = 1:NJ # Iterate through joints affecting the pose
+        k_j = world_joint_axes[j]    # World axis vector for joint j
+        pos_j = world_joint_positions[j] # World position of joint j origin
+
+        # Check if prismatic or revolute (based on twist w component)
+        # Assuming revolute for now based on Yaskawa example
+        # If prismatic, Jv_j = k_j, Jw_j = 0
+        is_revolute = norm(k_j) > 1e-9 # Simple check
+
+        if is_revolute
+             # Ensure k_j is normalized if using it directly for magnitude
+            # k_j_norm = normalize(k_j) # Use normalized axis if twist wasn't unit vector
+             k_j_norm = k_j # Assume twist w was unit vector
+
+             # Geometric Jacobian columns
+             Jv_j = cross(k_j_norm, r_i - pos_j)
+             Jw_j = k_j_norm # World angular velocity contribution
+             J_pose[1:3, j] = Jv_j
+             J_w[:, j] = Jw_j # Assign to the view
+        else # Prismatic
+             @warn "Prismatic joints not fully handled in Jacobian yet"
+             # For simplicity, assume all are revolute matching GP4 example
+             J_pose[1:3, j] = k_j
+             J_w[:, j] = zeros(T, 3)
+        end
+    end
+
+    # Orientation Jacobian J_p = B(p_i) * J_w (Rows 4-6)
+    # This overwrites the J_w we just calculated, using it as input
+    B_pi = B_matrix_mrp(SVector{3,T}(p_i))
+    J_p = B_pi * J_w # Calculate J_p = B * (angular part of geometric Jacobian)
+    J_pose[4:6, :] = J_p
+
+    return J_pose
+end
 
 # Create indexing variables for optimization vector and constraints
 function create_idx(nx, nu, N)
@@ -276,70 +349,17 @@ function inequality_constraint(params, Z)
     P_links = params.P_links
     collision_threshold = params.collision_threshold
     
-    # Calculate the number of constraints correctly
-    # State limits for position, velocity, acceleration (upper & lower bounds)
-    n_state_limits_per_robot = N * 3 * NJ * 2
-    n_state_limits = NUM_ROBOTS * n_state_limits_per_robot
-    
     # Collision constraints between robots
     n_collision_constraints = N * N_LINKS * N_LINKS
     
     # Total inequality constraints
-    n_ineq = n_state_limits + n_collision_constraints
+    n_ineq = n_collision_constraints
     
     # Initialize constraint vector with correct size
     c = zeros(eltype(Z), n_ineq)
-    constraint_idx = 1
-    
-    # 1. State Limits for both robots at each knot point
-    for i = 1:N
-        x_i = Z[idx.x[i]]
-        
-        for r = 1:NUM_ROBOTS
-            offset = (r - 1) * NX_PER_ROBOT
-            
-            # Position limits
-            q = x_i[offset .+ (1:NJ)]
-            for j = 1:NJ
-                # Upper bound: q[j] <= q_max => q[j] - q_max <= 0
-                c[constraint_idx] = q[j] - params.q_lim[r][2][j]
-                constraint_idx += 1
-                
-                # Lower bound: q_min <= q[j] => q_min - q[j] <= 0
-                c[constraint_idx] = params.q_lim[r][1][j] - q[j]
-                constraint_idx += 1
-            end
-            
-            # Velocity limits
-            dq = x_i[offset .+ (NJ+1:2*NJ)]
-            for j = 1:NJ
-                # Upper bound: dq[j] <= dq_max => dq[j] - dq_max <= 0
-                c[constraint_idx] = dq[j] - params.dq_lim[r][2][j]
-                constraint_idx += 1
-                
-                # Lower bound: dq_min <= dq[j] => dq_min - dq[j] <= 0
-                c[constraint_idx] = params.dq_lim[r][1][j] - dq[j]
-                constraint_idx += 1
-            end
-            
-            # Acceleration limits
-            ddq = x_i[offset .+ (2*NJ+1:3*NJ)]
-            for j = 1:NJ
-                # Upper bound: ddq[j] <= ddq_max => ddq[j] - ddq_max <= 0
-                c[constraint_idx] = ddq[j] - params.ddq_lim[r][2][j]
-                constraint_idx += 1
-                
-                # Lower bound: ddq_min <= ddq[j] => ddq_min - ddq[j] <= 0
-                c[constraint_idx] = params.ddq_lim[r][1][j] - ddq[j]
-                constraint_idx += 1
-            end
-        end
-    end
-    
-    # Debugging check
-    @assert constraint_idx - 1 == n_state_limits "Expected $n_state_limits state limit constraints, but used $(constraint_idx-1)"
-    
-    # 2. Collision Avoidance Constraints
+    constraint_idx = 1 
+         
+    # 1. Collision Avoidance Constraints
     for i = 1:N
         x_i = Z[idx.x[i]]
         
@@ -387,10 +407,123 @@ function inequality_constraint(params, Z)
     return c
 end
 
+
+function analytical_combined_constraints_jacobian(params, Z::AbstractVector{T_Z}) where T_Z
+    N = params.N
+    idx = params.idx
+    NX = params.idx.nx
+    NU = params.idx.nu
+    NJ = NUM_JOINTS_PER_ROBOT # From const in multi_arm_dircol.jl
+    NX_PER_ROBOT_const = NX_PER_ROBOT # From const
+
+    # --- Jacobian of Equality Constraints ---
+    # For now, using ForwardDiff for the equality part.
+    # This can be made fully analytical later if needed.
+    J_eq = ForwardDiff.jacobian(z_ -> equality_constraint(params, z_), Z)
+
+    # Recalculate n_ineq to be sure
+    dummy_ineq_cons = inequality_constraint(params, Z) # Evaluate to get size
+    n_ineq_actual = length(dummy_ineq_cons)
+
+    # Initialize sparse Jacobian for inequalities
+    # J_ineq needs to be built carefully, perhaps using sparse matrix constructors (I, J, V)
+    # For simplicity here, we'll make it dense then convert, or fill a preallocated sparse matrix.
+    # Let's assume it's dense for now and can be sparsified.
+    J_ineq_rows = Int[]
+    J_ineq_cols = Int[]
+    J_ineq_vals = T_Z[]
+
+    current_row_ineq = 0
+ 
+    
+    # 1. Collision Avoidance Constraints
+    # inequality_constraint updates P_links poses internally. We must replicate that.
+    P_links_current = deepcopy(params.P_links) # Make a mutable copy for FK updates
+
+    for i_knot = 1:N
+        x_i = Z[idx.x[i_knot]]
+        q1 = x_i[1:NJ]
+        q2 = x_i[NX_PER_ROBOT_const .+ (1:NJ)]
+
+        poses1_world, _, _, _ = forward_kinematics_poe(q1, params.robot_kin[1])
+        poses2_world, _, _, _ = forward_kinematics_poe(q2, params.robot_kin[2])
+        
+        all_poses_world_knot = [poses1_world, poses2_world]
+        for r_update = 1:NUM_ROBOTS
+            poses_r_knot = all_poses_world_knot[r_update]
+            for j_link_update = 1:N_LINKS
+                T_link_center_knot = poses_r_knot[j_link_update]
+                P_links_current[r_update][j_link_update].r = T_link_center_knot.translation
+                P_links_current[r_update][j_link_update].p = Rotations.params(Rotations.MRP(RotMatrix(T_link_center_knot.linear)))
+            end
+        end
+
+        q1_indices_in_Z = idx.x[i_knot][1:NJ]
+        q2_indices_in_Z = idx.x[i_knot][NX_PER_ROBOT_const .+ (1:NJ)]
+        pose1_slice = 1:6
+        pose2_slice = 7:12
+
+        for link1_idx = 1:N_LINKS
+            for link2_idx = 1:N_LINKS
+                current_row_ineq += 1
+                
+                P1 = P_links_current[1][link1_idx]
+                P2 = P_links_current[2][link2_idx]
+
+                _prox_val, J_prox_combined = dc.proximity_gradient(P1, P2)
+                J_prox_P1_pose = J_prox_combined[pose1_slice] 
+                J_prox_P2_pose = J_prox_combined[pose2_slice]
+
+                J_fk1_q1 = calculate_link_pose_jacobian_geom(q1, link1_idx, params.robot_kin[1])
+                J_fk2_q2 = calculate_link_pose_jacobian_geom(q2, link2_idx, params.robot_kin[2])
+                
+                # Constraint is: params.collision_threshold - prox <= 0
+                # Jacobian of constraint w.r.t. prox is -1.
+                # Jacobian of prox w.r.t. pose1 is J_prox_P1_pose'
+                # Jacobian of pose1 w.r.t. q1 is J_fk1_q1
+                # So, d(constraint)/dq1 = -1 * J_prox_P1_pose' * J_fk1_q1
+                
+                # Contribution from q1
+                jac_contrib_q1 = -J_prox_P1_pose' * J_fk1_q1
+                for col_idx = 1:NJ
+                    if abs(jac_contrib_q1[col_idx]) > 1e-9 # Add if non-zero
+                        push!(J_ineq_rows, current_row_ineq)
+                        push!(J_ineq_cols, q1_indices_in_Z[col_idx])
+                        push!(J_ineq_vals, jac_contrib_q1[col_idx])
+                    end
+                end
+                
+                # Contribution from q2
+                jac_contrib_q2 = -J_prox_P2_pose' * J_fk2_q2
+                 for col_idx = 1:NJ
+                    if abs(jac_contrib_q2[col_idx]) > 1e-9 # Add if non-zero
+                        push!(J_ineq_rows, current_row_ineq)
+                        push!(J_ineq_cols, q2_indices_in_Z[col_idx])
+                        push!(J_ineq_vals, jac_contrib_q2[col_idx])
+                    end
+                end
+            end
+        end
+    end
+    
+    if current_row_ineq != n_ineq_actual
+        @warn "Row count mismatch in analytical_combined_constraints_jacobian for inequalities! Expected $n_ineq_actual, got $current_row_ineq"
+    end
+
+    J_ineq_sparse = sparse(J_ineq_rows, J_ineq_cols, J_ineq_vals, n_ineq_actual, idx.nz)
+
+    # Combine Jacobians
+    # J_eq is dense from ForwardDiff. J_ineq_sparse is sparse.
+    # vcat should handle this and produce a sparse matrix if J_eq is converted to sparse first.
+    J_combined = SparseArrays.vcat(SparseArrays.sparse(J_eq), J_ineq_sparse)
+    
+    return J_combined
+end
+
 # Main function to set up and solve the optimization problem
 function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_goal1, q_start2, q_goal2)
     # Problem dimensions
-    N = 51            # Number of knot points
+    N = 11           # Number of knot points
     dt = 0.1          # Time step
     tf = (N-1) * dt   # Final time
     
@@ -416,9 +549,6 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     q_lim_single = (fill(Q_LIMITS[1], NJ), fill(Q_LIMITS[2], NJ))
     dq_lim_single = (fill(DQ_LIMITS[1], NJ), fill(DQ_LIMITS[2], NJ))
     ddq_lim_single = (fill(DDQ_LIMITS[1], NJ), fill(DDQ_LIMITS[2], NJ))
-    q_lim_all = [q_lim_single, q_lim_single]
-    dq_lim_all = [dq_lim_single, dq_lim_single]
-    ddq_lim_all = [ddq_lim_single, ddq_lim_single]
     
     # Control limits (jerk)
     u_min = fill(JERK_LIMITS[1], NU)
@@ -434,30 +564,20 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
         Q = Q,
         R = R,
         Qf = Qf,
-        q_lim = q_lim_all,
-        dq_lim = dq_lim_all,
-        ddq_lim = ddq_lim_all,
         u_min = u_min,
         u_max = u_max,
         robot_kin = [robot_kin1, robot_kin2],
         P_links = P_links,
         collision_threshold = COLLISION_THRESHOLD
     )
-    
-    # Calculate constraint dimensions for verification
-    # Calculate the number of constraints correctly
-    # State limits
-    n_state_limits_per_robot = N * 3 * NJ * 2
-    n_state_limits = NUM_ROBOTS * n_state_limits_per_robot
-    
+
     # Collision constraints
     n_collision_constraints = N * N_LINKS * N_LINKS
     
     # Total inequality constraints
-    n_ineq = n_state_limits + n_collision_constraints
+    n_ineq = n_collision_constraints
     
     println("Number of inequality constraints: $n_ineq")
-    println("- State limits: $n_state_limits")
     println("- Collision constraints: $n_collision_constraints")
     
     # Initial guess - linear interpolation
@@ -519,6 +639,10 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     # Fix initial state
     x_l[idx.x[1]] = x0
     x_u[idx.x[1]] = x0
+
+    # Fix goal state
+    x_l[idx.x[N]] = xg
+    x_u[idx.x[N]] = xg
     
     # Inequality constraint bounds
     c_ineq_l = -Inf * ones(n_ineq)
@@ -532,9 +656,10 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     println("Starting trajectory optimization using direct collocation...")
     
     # Solve the optimization problem
-    diff_type = :finite  # Use ForwardDiff for derivatives
+    diff_type = :analytical  # Use ForwardDiff for derivatives
     Z = fmincon(point_cost, equality_constraint, inequality_constraint,
                 x_l, x_u, c_ineq_l, c_ineq_u, z0, params, diff_type;
+                analytical_constraint_jacobian=analytical_combined_constraints_jacobian,
                 tol=1e-2, c_tol=1e-2, max_iters=3000, verbose=true)
     
     println("Optimization complete!")
@@ -542,8 +667,155 @@ function solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, q_start1, q_go
     # Extract optimal trajectories
     X = [Z[idx.x[i]] for i = 1:N]
     U = [Z[idx.u[i]] for i = 1:N-1]
+
+    check_solution_constraints(X, U, x0, xg, 
+        q_lim_single, dq_lim_single, ddq_lim_single, u_min, u_max)
     
     return X, U
+end
+
+function check_solution_constraints(X_sol, U_sol, x0_target, xg_target, 
+                                    q_lims_tuple, dq_lims_tuple, ddq_lims_tuple, 
+                                    u_min_vec, u_max_vec; tol=1e-6)
+    
+    N_states = length(X_sol)
+    N_controls = length(U_sol)
+    
+    if N_states == 0
+        println("X_sol is empty. Cannot check constraints.")
+        return false
+    end
+
+    violations_found = false
+    println("\n--- Checking Solution Constraints (Tolerance: $tol) ---")
+
+    # Initialize min/max trackers for each joint of each robot
+    # Dimensions: [robot_idx, joint_idx]
+    min_q_obs = fill(Inf, NUM_ROBOTS, NJ)
+    max_q_obs = fill(-Inf, NUM_ROBOTS, NJ)
+    min_dq_obs = fill(Inf, NUM_ROBOTS, NJ)
+    max_dq_obs = fill(-Inf, NUM_ROBOTS, NJ)
+    min_ddq_obs = fill(Inf, NUM_ROBOTS, NJ)
+    max_ddq_obs = fill(-Inf, NUM_ROBOTS, NJ)
+    min_jerk_obs = fill(Inf, NUM_ROBOTS, NJ)
+    max_jerk_obs = fill(-Inf, NUM_ROBOTS, NJ)
+
+    # 1. Initial State Constraint
+    if !isapprox(X_sol[1], x0_target; atol=tol)
+        println("VIOLATION: Initial state constraint not met.")
+        println("  Expected X[1]: $x0_target")
+        println("  Got X[1]:      $(X_sol[1])")
+        println("  Difference:    $(X_sol[1] - x0_target)")
+        violations_found = true
+    else
+        println("Initial state constraint: SATISFIED")
+    end
+
+    # 2. Goal State Constraint
+    # Note: The problem setup in solve_trajectory_dircol fixes the entire final state X_sol[N] to xg.
+    if !isapprox(X_sol[end], xg_target; atol=tol)
+        println("VIOLATION: Goal state constraint not met.")
+        println("  Expected X[end]: $xg_target")
+        println("  Got X[end]:      $(X_sol[end])")
+        println("  Difference:      $(X_sol[end] - xg_target)")
+        violations_found = true
+    else
+        println("Goal state constraint: SATISFIED")
+    end
+    
+    println("\nChecking state and control limits over trajectory:")
+
+    # 3. State Limits (q, dq, ddq)
+    for k = 1:N_states
+        x_k = X_sol[k]
+        
+        q_vals = [x_k[1:NJ], x_k[NX_PER_ROBOT .+ (1:NJ)]]
+        dq_vals = [x_k[NJ+1 : 2*NJ], x_k[NX_PER_ROBOT .+ (NJ+1 : 2*NJ)]]
+        ddq_vals = [x_k[2*NJ+1 : 3*NJ], x_k[NX_PER_ROBOT .+ (2*NJ+1 : 3*NJ)]]
+
+        for r = 1:NUM_ROBOTS
+            for j = 1:NJ
+                # Position
+                q_val = q_vals[r][j]
+                min_q_obs[r,j] = min(min_q_obs[r,j], q_val)
+                max_q_obs[r,j] = max(max_q_obs[r,j], q_val)
+                if q_val < q_lims_tuple[1][j] - tol || q_val > q_lims_tuple[2][j] + tol
+                    println("VIOLATION: Robot $r, Joint $j, q limit @ k=$k. Value: $q_val, Limits: [$(q_lims_tuple[1][j]), $(q_lims_tuple[2][j])]")
+                    violations_found = true
+                end
+
+                # Velocity
+                dq_val = dq_vals[r][j]
+                min_dq_obs[r,j] = min(min_dq_obs[r,j], dq_val)
+                max_dq_obs[r,j] = max(max_dq_obs[r,j], dq_val)
+                if dq_val < dq_lims_tuple[1][j] - tol || dq_val > dq_lims_tuple[2][j] + tol
+                    println("VIOLATION: Robot $r, Joint $j, dq limit @ k=$k. Value: $dq_val, Limits: [$(dq_lims_tuple[1][j]), $(dq_lims_tuple[2][j])]")
+                    violations_found = true
+                end
+
+                # Acceleration
+                ddq_val = ddq_vals[r][j]
+                min_ddq_obs[r,j] = min(min_ddq_obs[r,j], ddq_val)
+                max_ddq_obs[r,j] = max(max_ddq_obs[r,j], ddq_val)
+                if ddq_val < ddq_lims_tuple[1][j] - tol || ddq_val > ddq_lims_tuple[2][j] + tol
+                    println("VIOLATION: Robot $r, Joint $j, ddq limit @ k=$k. Value: $ddq_val, Limits: [$(ddq_lims_tuple[1][j]), $(ddq_lims_tuple[2][j])]")
+                    violations_found = true
+                end
+            end
+        end
+    end
+
+    # 4. Control (Jerk) Limits
+    if N_controls > 0 && N_controls == N_states - 1
+        for k = 1:N_controls
+            u_k = U_sol[k]
+            jerk_vals_r1 = u_k[1:NJ]
+            jerk_vals_r2 = u_k[NU_PER_ROBOT .+ (1:NJ)] # Or u_k[NJ+1 : NU]
+            
+            all_jerk_vals = [jerk_vals_r1, jerk_vals_r2]
+
+            for r = 1:NUM_ROBOTS
+                u_offset = (r-1)*NU_PER_ROBOT
+                for j = 1:NJ
+                    jerk_val = all_jerk_vals[r][j]
+                    min_jerk_obs[r,j] = min(min_jerk_obs[r,j], jerk_val)
+                    max_jerk_obs[r,j] = max(max_jerk_obs[r,j], jerk_val)
+                    
+                    # u_min_vec and u_max_vec are for the combined control vector u
+                    current_u_idx = u_offset + j
+                    if jerk_val < u_min_vec[current_u_idx] - tol || jerk_val > u_max_vec[current_u_idx] + tol
+                        println("VIOLATION: Robot $r, Joint $j, Jerk limit @ k=$k. Value: $jerk_val, Limits: [$(u_min_vec[current_u_idx]), $(u_max_vec[current_u_idx])]")
+                        violations_found = true
+                    end
+                end
+            end
+        end
+    elseif N_controls > 0
+         println("WARNING: Number of control inputs ($(N_controls)) does not match N_states-1 ($(N_states-1)). Skipping detailed control limit checks.")
+    end
+
+    println("\n--- Summary of Observed Min/Max Values ---")
+    for r = 1:NUM_ROBOTS
+        println("\nRobot $r:")
+        for j = 1:NJ
+            println("  Joint $j:")
+            println("    Position (q): MinObs=$(round(min_q_obs[r,j], digits=4)), MaxObs=$(round(max_q_obs[r,j], digits=4)), Limits=[$(q_lims_tuple[1][j]), $(q_lims_tuple[2][j])]")
+            println("    Velocity (dq): MinObs=$(round(min_dq_obs[r,j], digits=4)), MaxObs=$(round(max_dq_obs[r,j], digits=4)), Limits=[$(dq_lims_tuple[1][j]), $(dq_lims_tuple[2][j])]")
+            println("    Accel (ddq): MinObs=$(round(min_ddq_obs[r,j], digits=4)), MaxObs=$(round(max_ddq_obs[r,j], digits=4)), Limits=[$(ddq_lims_tuple[1][j]), $(ddq_lims_tuple[2][j])]")
+            if N_controls > 0
+                u_idx_for_jerk_limit = (r-1)*NU_PER_ROBOT + j
+                println("    Jerk (u):     MinObs=$(round(min_jerk_obs[r,j], digits=4)), MaxObs=$(round(max_jerk_obs[r,j], digits=4)), Limits=[$(u_min_vec[u_idx_for_jerk_limit]), $(u_max_vec[u_idx_for_jerk_limit])]")
+            end
+        end
+    end
+
+    if !violations_found
+        println("\nAll checked constraints appear to be SATISFIED within tolerance $tol.")
+    else
+        println("\nSome constraints were VIOLATED (see messages above).")
+    end
+    
+    return !violations_found
 end
 
 function main()
@@ -553,10 +825,10 @@ function main()
         # Twists ξᵢ (Defined in base frame {0} at q=0)
         w1 = SA[T(0), T(0), T(1)]; p1 = SA[T(0), T(0), T(0)]
         w2 = SA[T(0), T(1), T(0)]; p2 = SA[T(0), T(0), T(0.33)]
-        w3 = SA[T(0), T(1), T(0)]; p3 = SA[T(0), T(0), T(0.33+0.26)]
-        w4 = SA[T(1), T(0), T(0)]; p4 = SA[T(0.1), T(0), T(0.33+0.26+0.015)]
+        w3 = SA[T(0), T(-1), T(0)]; p3 = SA[T(0), T(0), T(0.33+0.26)]
+        w4 = SA[T(-1), T(0), T(0)]; p4 = SA[T(0.1), T(0), T(0.33+0.26+0.015)]
         w5 = SA[T(0), T(-1), T(0)]; p5 = SA[T(0.1+0.19), T(0), T(0.33+0.26+0.015)]
-        w6 = SA[T(1), T(0), T(0)]; p6 = SA[T(0.1+0.19+0.072), T(0), T(0.33+0.26+0.015)]
+        w6 = SA[T(-1), T(0), T(0)]; p6 = SA[T(0.1+0.19+0.072), T(0), T(0.33+0.26+0.015)]
         twists_base = [
             vcat(-cross(w1, p1), w1), vcat(-cross(w2, p2), w2), vcat(-cross(w3, p3), w3),
             vcat(-cross(w4, p4), w4), vcat(-cross(w5, p5), w5), vcat(-cross(w6, p6), w6)
@@ -615,10 +887,14 @@ function main()
         end
 
         # Start and Goal States
-        q_start1 = [0.0, 0, 0.0, 0.0, -π/2, 0.0]
-        q_goal1 = [0.0, π/5, -π/5, 0, -π/4, 0.0]
-        q_start2 = [0.0, 0, 0.0, 0.0, -π/2, 0.0]
-        q_goal2 = [0.0, π/5, π/5, 0, π/2, 0.0]
+        # q_start1 = [0.0, 0, 0.0, 0.0, -π/2, 0.0]
+        # q_goal1 = [0.0, π/5, -π/5, 0, -π/4, 0.0]
+        # q_start2 = [0.0, 0, 0.0, 0.0, -π/2, 0.0]
+        # q_goal2 = [0.0, π/5, π/5, 0, π/2, 0.0]
+        q_start1 = [-π/4, 0, 0.0, 0.0, 0.0, 0.0]
+        q_goal1 = [π/4, 0, 0.0, 0.0, 0.0, 0.0]
+        q_start2 = [-π/4, 0, 0.0, 0.0, 0.0, 0.0]
+        q_goal2 = [π/4, 0, 0.0, 0.0, 0.0, 0.0]
 
         # Solve using direct collocation
         X_sol, U_sol = solve_trajectory_dircol(robot_kin1, robot_kin2, P_links, 
